@@ -81,3 +81,18 @@ class CoverageCheckRequest(StrictModel):
     work_start: str = Field(..., description="作业区间起点（含），ISO-8601 带时区")
     work_end: str = Field(..., description="作业区间终点（不含），必须严格晚于起点")
     known_as_of: str = Field(..., description="知悉时刻（不得晚于服务端当前时刻），ISO-8601 带时区")
+
+
+class CorrectionProposalCreate(StrictModel):
+    """待审更正提案提交：内容与单条/批量更正完全一致，不接受任何处理字段。"""
+    items: list[CorrectionItem] = Field(
+        ..., min_length=1,
+        description="待审更正条目（字段与 POST /api/v1/corrections 的条目一致），"
+                    "至少 1 条；按输入顺序审核发布，后项可引用同批前项拟生成版本")
+
+
+class ProposalDecisionRequest(StrictModel):
+    """批准/拒绝提案的可选请求体（空对象或空请求体同样允许）。"""
+    reason: str | None = Field(
+        default=None,
+        description="处理说明（可选）；拒绝时建议填写原因，服务端原样留档")

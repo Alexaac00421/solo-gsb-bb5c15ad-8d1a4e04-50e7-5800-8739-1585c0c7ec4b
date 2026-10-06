@@ -284,3 +284,49 @@ def page_limit_too_small(limit: int, batch_seq: int, batch_size: int) -> DomainE
         http_status=422,
         details={"limit": limit, "batch_seq": batch_seq,
                  "batch_size": batch_size})
+
+
+# ---------------------------------------------------------------- 待审更正提案
+
+
+def invalid_credentials() -> DomainError:
+    return DomainError(
+        "invalid_credentials",
+        "缺少或无法识别的值班员凭证：待审更正接口要求 Authorization 头携带 "
+        "有效的 Bearer token（本地配置的值班员身份凭证）",
+        http_status=401)
+
+
+def insufficient_role(required_role: str) -> DomainError:
+    role_text = {"submit": "提交待审更正", "approve": "批准或拒绝待审更正"}
+    return DomainError(
+        "insufficient_role",
+        f"当前值班员身份不具备所需角色：本操作需要 {required_role!r} 角色"
+        f"（{role_text.get(required_role, required_role)}）",
+        http_status=403, details={"required_role": required_role})
+
+
+def proposal_not_found(proposal_id: str) -> DomainError:
+    return DomainError(
+        "proposal_not_found", f"待审更正提案 {proposal_id} 不存在",
+        http_status=404, details={"proposal_id": proposal_id})
+
+
+def reviewer_is_submitter(operator_name: str) -> DomainError:
+    return DomainError(
+        "reviewer_is_submitter",
+        f"审核人 {operator_name} 同时是该提案的提交人：提交人与审核人不得相同，"
+        f"请由另一名具审核权限的值班员处理",
+        http_status=403, details={"operator": operator_name})
+
+
+def proposal_already_decided(proposal_id: str, status: str,
+                             reviewer: str, decided_at: str) -> DomainError:
+    verb = "已批准" if status == "approved" else "已拒绝"
+    return DomainError(
+        "proposal_already_decided",
+        f"提案 {proposal_id} {verb}（处理人 {reviewer}，处理时刻 {decided_at}）："
+        f"提案只可处理一次，重复处理一律拒绝、状态不变；已拒绝提案不可再批准",
+        http_status=409,
+        details={"proposal_id": proposal_id, "status": status,
+                 "reviewed_by": reviewer, "reviewed_at": decided_at})

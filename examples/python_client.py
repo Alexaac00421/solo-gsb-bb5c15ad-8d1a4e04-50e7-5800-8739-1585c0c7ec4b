@@ -3,6 +3,15 @@
 
 前置：服务已在本机启动（docker compose up --build 或 uvicorn app.main:app）。
 用法：python examples/python_client.py [BASE_URL]
+
+待审更正提案接口需要值班员凭证（Bearer token）。本地开发态内置凭证如下
+（生产用环境变量 SOP_OPERATORS 覆盖，见 README 第二节）：
+
+    duty-alice      submit             dev-token-alice-2026
+    duty-bob        submit             dev-token-bob-2026
+    duty-carol      submit             dev-token-carol-2026
+    duty-supervisor submit,approve     dev-token-supervisor-2026
+    duty-reviewer   approve            dev-token-reviewer-2026
 """
 from __future__ import annotations
 
@@ -13,12 +22,19 @@ import urllib.request
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 
+# 开发态内置值班员凭证（仅用于本地/示例；生产请通过 SOP_OPERATORS 配置）
+TOKEN_ALICE = "dev-token-alice-2026"
+TOKEN_REVIEWER = "dev-token-reviewer-2026"
 
-def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+
+def call(method: str, path: str, body: dict | None = None,
+         token: str | None = None) -> tuple[int, dict]:
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
-        BASE_URL + path, data=data, method=method,
-        headers={"Content-Type": "application/json"})
+        BASE_URL + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, json.loads(resp.read())
@@ -136,6 +152,124 @@ def main() -> None:
 
     # 16) 跨规程版本覆盖检查（本轮新增）：调度员安排跨规程作业前核对版本覆盖
     _coverage_examples()
+
+    # 17) 待审更正提案（凭证提交 / 他人审核 / 批准时事务内重验整批）
+    _correction_proposal_examples()
+
+
+def _correction_proposal_examples() -> None:
+    """待审更正提案：提交不可变提案 -> 他人批准/拒绝 -> 查询发布版本。"""
+    number = "SOP-DEMO-PROP-001"
+    call("POST", "/api/v1/releases", {
+        "number": number,
+        "body": "提案演示初版：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z"})
+
+    # 17.1) 无凭证提交 -> 401 invalid_credentials
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "items": [{"number": number, "base_revision": 0,
+                   "valid_start": "2026-03-01T00:00:00Z",
+                   "valid_end": "2026-04-01T00:00:00Z",
+                   "body": "无凭证，应被拒绝。"}]})
+    show("17.1a 无凭证提交提案 -> 401 invalid_credentials", status, res)
+
+    # 17.2) duty-alice（submit 角色）凭 Bearer token 提交批量提案（2 条，
+    #       后项引用同批前项拟生成版本）；只保存不可变提案、不占版本号。
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "items": [
+            {"number": number, "base_revision": 0,
+             "valid_start": "2026-03-01T00:00:00Z",
+             "valid_end": "2026-04-01T00:00:00Z",
+             "body": "提案三月版：检修期加派监护。"},            # 省略 -> 继承前置
+            {"number": number, "base_revision": 1,
+             "valid_start": "2026-03-10T00:00:00Z",
+             "valid_end": "2026-03-20T00:00:00Z",
+             "body": "提案三月中：全套防割装备。"},              # 后项引用前项
+        ]}, token=TOKEN_ALICE)
+    show("17.1b alice 提交批量待审提案（201 pending，不占版本号）", status, res)
+    proposal_id = res["id"]
+    # 提交时历史仍只有 r0
+    status, hist = call("GET", f"/api/v1/procedures/{number}/history")
+    show("17.2 提交后历史仍只有 r0（提案不占版本号）", status,
+         [v["revision"] for v in hist["items"]])
+
+    # 17.3) alice 只有 submit 角色，尝试批准自己的提案 -> 403 insufficient_role。
+    # 兼具两种角色的值班员自提自审则 -> 403 reviewer_is_submitter（提交人与
+    # 审核人不得相同），两种拒绝都不改变提案状态。
+    status, res = call(
+        "POST", f"/api/v1/correction-proposals/{proposal_id}/approve",
+        {}, token=TOKEN_ALICE)
+    show("17.3 提交人无审核角色批准 -> 403 insufficient_role", status, res)
+
+    # 17.4) duty-reviewer（approve 角色，不同于提交人）批准。批准在同一写事务
+    #       内按当前版本链重验整批，通过后发布 r1/r2 并写入原审计批次。
+    status, res = call(
+        "POST", f"/api/v1/correction-proposals/{proposal_id}/approve",
+        {}, token=TOKEN_REVIEWER)
+    show("17.4a reviewer 批准（200，发布 r1/r2，含审计批次号）", status, res)
+    # 重复批准 -> 409 状态不变
+    status, res = call(
+        "POST", f"/api/v1/correction-proposals/{proposal_id}/approve",
+        {}, token=TOKEN_REVIEWER)
+    show("17.4b 重复批准 -> 409 proposal_already_decided", status, res)
+
+    # 17.5) 按编号查询：内容、状态、提交/处理人、处理时刻与发布版本
+    status, res = call(
+        "GET", f"/api/v1/correction-proposals/{proposal_id}",
+        token=TOKEN_ALICE)
+    show("17.5 按编号查询提案（approved + published_items）", status, res)
+
+    # 17.6) 拒绝流程（终态）：bob 提交五月提案，reviewer 拒绝；
+    #       已拒绝不可再批准，拒绝不写版本、不写审计。
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "items": [{"number": number, "base_revision": 0,
+                   "valid_start": "2026-05-01T00:00:00Z",
+                   "valid_end": "2026-06-01T00:00:00Z",
+                   "body": "五月提案，将被拒绝。"}]},
+        token="dev-token-bob-2026")
+    rejected_id = res["id"]
+    status, res = call(
+        "POST", f"/api/v1/correction-proposals/{rejected_id}/reject",
+        {"reason": "依据的基版区间需要再核对"}, token=TOKEN_REVIEWER)
+    show("17.6a reviewer 拒绝（rejected 终态，可带 reason）", status, res)
+    status, res = call(
+        "POST", f"/api/v1/correction-proposals/{rejected_id}/approve",
+        {}, token=TOKEN_REVIEWER)
+    show("17.6b 已拒绝提案不可批准 -> 409", status, res)
+    status, hist = call("GET", f"/api/v1/procedures/{number}/history")
+    show("17.6c 拒绝不占版本号（历史只有 r0/r1/r2）", status,
+         [v["revision"] for v in hist["items"]])
+
+    # 17.7) 批准时的事务内重验：carol 先提案十月区间，随后他人走直接更正
+    #       抢先占用，批准按当前版本链重验 -> 409 expired_base_version，
+    #       带条目位置 index，提案仍 pending、不留部分版本/审计。
+    win = {"valid_start": "2026-10-01T00:00:00Z",
+           "valid_end": "2026-11-01T00:00:00Z"}
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "items": [{"number": number, "base_revision": 0, **win,
+                   "body": "十月提案（等待期间区间被抢占）。"}]},
+        token="dev-token-carol-2026")
+    waiting_id = res["id"]
+    call("POST", "/api/v1/corrections",
+         {"number": number, "base_revision": 0, **win,
+          "body": "直接更正抢先发布。"})
+    status, res = call(
+        "POST", f"/api/v1/correction-proposals/{waiting_id}/approve",
+        {}, token=TOKEN_REVIEWER)
+    show("17.7a 批准时重验失败 -> 409 expired_base_version（index=0）",
+         status, res)
+    status, res = call(
+        "GET", f"/api/v1/correction-proposals/{waiting_id}",
+        token=TOKEN_REVIEWER)
+    show("17.7b 冲突后提案仍 pending、无发布版本", status,
+         {"status": res["status"], "published_items": res["published_items"]})
+
+    # 17.8) 既有直接更正、回溯、审计接口无需凭证，契约保持可用
+    status, res = call("GET", "/api/v1/audit/events?limit=10")
+    show("17.8 审计接口仍可直接访问（批准的提案作为 correction 批次出现）",
+         status, [(e["operation"], e["number"], e["revision"])
+                  for e in res["events"]])
 
 
 def _coverage_examples() -> None:

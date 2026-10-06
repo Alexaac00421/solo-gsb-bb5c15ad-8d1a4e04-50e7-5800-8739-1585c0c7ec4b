@@ -108,6 +108,30 @@ CREATE TABLE IF NOT EXISTS audit_events (
     UNIQUE(batch_seq, position)
 );
 
+-- 待审更正提案：值班员凭本地身份凭证提交，保存**不可变提案**（items_json 为
+-- 提交时的原始更正字段快照，沿用单条/批量更正字段）。提交不写 versions、
+-- 不占版本号；只有另一名具审核权限的值班员在同一写事务内重验整批并通过后，
+-- 版本与审计批次才与本状态更新一起原子落库。状态机：
+-- pending -> approved（成功发布版本，published_batch_seq 指向审计批次）
+-- pending -> rejected（终态，不可再批准）。reviewed_* 只写入一次，重复处理
+-- 在写事务内按当前状态拒绝，并发批准至多成功一次。
+CREATE TABLE IF NOT EXISTS correction_proposals (
+    id                    TEXT PRIMARY KEY,
+    item_count            INTEGER NOT NULL,
+    items_json            TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+    submitted_by          TEXT NOT NULL,
+    submitted_at          TEXT NOT NULL,
+    reviewed_by           TEXT,
+    reviewed_at           TEXT,
+    review_reason         TEXT,
+    published_at          TEXT,
+    published_batch_seq   INTEGER REFERENCES audit_batches(seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_correction_proposals_status
+    ON correction_proposals(status, submitted_at);
+
 CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query

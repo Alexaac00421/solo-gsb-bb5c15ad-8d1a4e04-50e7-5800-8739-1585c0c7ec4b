@@ -1,29 +1,33 @@
 """FastAPI 入口：HTTP API 与统一错误处理。"""
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import service
+from . import errors, service
+from .auth import ROLE_APPROVE, ROLE_SUBMIT, authenticate
 from .config import settings
 from .db import init_db
 from .errors import DomainError
 from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
-                      CorrectionPreviewItem, CoverageCheckRequest,
-                      PackageRequest, ReleaseBatch, ReleaseItem,
+                      CorrectionPreviewItem, CorrectionProposalCreate,
+                      CoverageCheckRequest, PackageRequest,
+                      ProposalDecisionRequest, ReleaseBatch, ReleaseItem,
                       WithdrawalBatch, WithdrawalItem)
 
 app = FastAPI(
     title="安全作业规程历史回溯服务",
-    version="1.0.0",
+    version="1.1.0",
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
                  "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）、"
-                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号），"
-                 "以及调度员安排跨规程作业前的版本覆盖检查（逐段整组状态）。"),
+                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号）、"
+                 "值班员凭本地凭证提交/审核待审更正提案（批准时在同一事务内"
+                 "重验整批并写入原审计批次），以及调度员安排跨规程作业前的"
+                 "版本覆盖检查（逐段整组状态）。"),
 )
 
 
@@ -74,8 +78,42 @@ def index() -> dict:
                 "GET  /api/v1/procedures/{number}/closure",
                 "GET  /api/v1/procedures/{number}/closure-plan",
                 "POST /api/v1/coverage/check",
+                "POST /api/v1/correction-proposals",
+                "GET  /api/v1/correction-proposals/{proposal_id}",
+                "POST /api/v1/correction-proposals/{proposal_id}/approve",
+                "POST /api/v1/correction-proposals/{proposal_id}/reject",
                 "GET  /api/v1/audit/events",
             ]}
+
+
+# ------------------------------------------------------------ 值班员凭证鉴权
+
+
+def _current_operator(
+        authorization: str | None = Header(default=None)):
+    """解析 Authorization: Bearer <token> 为本地配置的值班员身份。
+
+    缺失/无法识别 -> 401 invalid_credentials；仅待审更正相关接口使用本依赖，
+    既有直接更正/回溯/审计接口契约不变、无需凭证。
+    """
+    operator = authenticate(authorization, settings.operators)
+    if operator is None:
+        raise errors.invalid_credentials()
+    return operator
+
+
+def _require_role(required_role: str):
+    def _dependency(operator=Depends(_current_operator)):
+        if not operator.can(required_role):
+            raise errors.insufficient_role(required_role)
+        return operator
+    return _dependency
+
+
+def _different_reviewer(operator, submitted_by: str) -> None:
+    """提交人与审核人不得相同（仅处理接口调用）。"""
+    if operator.name == submitted_by:
+        raise errors.reviewer_is_submitter(operator.name)
 
 
 def _coerce_items(payload: dict, single_cls, batch_cls):
@@ -135,6 +173,82 @@ def _coerce_preview(payload: dict) -> tuple[list, str, str]:
         return [single], single.work_start, single.work_end
     except ValidationError as exc:
         raise RequestValidationError(exc.errors())
+
+
+# ------------------------------------------------------- 待审更正提案
+
+
+@app.post("/api/v1/correction-proposals", status_code=201)
+async def create_proposal(req: CorrectionProposalCreate,
+                          operator=Depends(_require_role(ROLE_SUBMIT))) -> dict:
+    """值班员提交待审更正提案：``Authorization: Bearer <token>`` 出示本地
+    配置且具 ``submit`` 角色的值班员身份。
+
+    请求体 ``{"items": [...]}``，条目字段与 ``POST /api/v1/corrections``
+    完全一致（至少 1 条）。服务保存**不可变提案**并返回编号、状态
+    （``pending``）与条目；提交不写版本、**不占版本号**、不推进审计日志。
+    401 凭证无效、403 缺少 submit 角色；额外字段 422。
+    """
+    return service.create_correction_proposal(req.items, operator)
+
+
+@app.get("/api/v1/correction-proposals/{proposal_id}")
+def get_proposal(proposal_id: str,
+                 operator=Depends(_current_operator)) -> dict:
+    """按编号查询待审更正提案（任一有效值班员身份即可）。
+
+    返回提案内容（不可变条目快照）、状态、提交人/提交时刻、处理人/处理时刻
+    与说明，以及批准成功后发布的版本（published_items）与发布时刻/审计批次；
+    pending/rejected 时发布字段为 null。提案不存在 -> 404 proposal_not_found。
+    """
+    return service.get_correction_proposal(proposal_id)
+
+
+async def _decision_payload(request: Request) -> dict:
+    """批准/拒绝允许空请求体、空对象或带可选 reason 的对象。"""
+    raw = await request.body()
+    if not raw or not raw.strip():
+        return {}
+    try:
+        return ProposalDecisionRequest.model_validate_json(raw).model_dump()
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors())
+
+
+@app.post("/api/v1/correction-proposals/{proposal_id}/approve", status_code=200)
+async def approve_proposal(proposal_id: str, request: Request,
+                           operator=Depends(_require_role(ROLE_APPROVE))) -> dict:
+    """批准待审更正提案：须由具 ``approve`` 角色且**不同于提交人**的值班员
+    调用（``Authorization: Bearer <token>``）。
+
+    在同一写事务内按**当前版本链**重验整批基版、子区间、前置清单与同批顺序，
+    通过后发布版本并写入原有审计批次，提案置为 approved；期间版本变化导致
+    任一条非法时返回现有冲突原因（``details.index`` 为条目位置），提案仍
+    pending，不留部分版本或审计事件。已处理提案重复处理（含批准已拒绝提案）
+    -> 409 proposal_already_decided；并发批准至多成功一次。
+    """
+    payload = await _decision_payload(request)
+    # 提交人≠审核人在读快照外先判定（事务内仍以留档的 submitted_by 复核身份）。
+    existing = service.get_correction_proposal(proposal_id)
+    _different_reviewer(operator, existing["submitted_by"])
+    return service.decide_correction_proposal(
+        proposal_id, operator, "approved", payload.get("reason"))
+
+
+@app.post("/api/v1/correction-proposals/{proposal_id}/reject", status_code=200)
+async def reject_proposal(proposal_id: str, request: Request,
+                          operator=Depends(_require_role(ROLE_APPROVE))) -> dict:
+    """拒绝待审更正提案：同样须由具 ``approve`` 角色且不同于提交人的值班员
+    调用。请求体可空，或 ``{"reason": "..."}`` 说明拒绝原因。
+
+    拒绝只更新提案状态（不写版本、不写审计）；已拒绝是终态，之后不可批准。
+    已处理提案重复处理 -> 409 proposal_already_decided、状态不变。
+    """
+    payload = await _decision_payload(request)
+    existing = service.get_correction_proposal(proposal_id)
+    _different_reviewer(operator, existing["submitted_by"])
+    return service.decide_correction_proposal(
+        proposal_id, operator, "rejected", payload.get("reason"))
 
 
 @app.post("/api/v1/withdrawals", status_code=201)

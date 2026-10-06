@@ -754,3 +754,117 @@ curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
         \"work_end\":   \"2026-03-01T00:00:00Z\",
         \"known_as_of\": \"$KNOWN2\"
       }"; echo
+
+# ===========================================================================
+# 13. 待审更正提案：值班员凭本地凭证提交，另一名审核人批准/拒绝
+# ===========================================================================
+# 开发态内置凭证（生产用环境变量 SOP_OPERATORS 覆盖）：
+#   submit  角色：duty-alice / duty-bob / duty-carol
+#   approve 角色：duty-reviewer（duty-supervisor 兼具两种角色）
+TOKEN_ALICE='dev-token-alice-2026'
+TOKEN_REVIEWER='dev-token-reviewer-2026'
+
+# 先发布一个供演示的规程（既有接口无需凭证）
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-CURL-PROP-001",
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+
+# --- 46a. 无凭证提交 -> 401 invalid_credentials --------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "items": [
+          {"number": "SOP-CURL-PROP-001", "base_revision": 0,
+           "valid_start": "2026-03-01T00:00:00Z",
+           "valid_end":   "2026-04-01T00:00:00Z",
+           "body": "无凭证应被拒绝。"}
+        ]
+      }'; echo
+
+# --- 46b. alice（submit）提交批量待审提案 -> 201 pending ------------------
+# 响应里的 id 即提案编号；提交不写版本、不占版本号、不写审计。
+PROPOSAL_ID=$(curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN_ALICE" \
+  -d '{
+        "items": [
+          {"number": "SOP-CURL-PROP-001", "base_revision": 0,
+           "valid_start": "2026-03-01T00:00:00Z",
+           "valid_end":   "2026-04-01T00:00:00Z",
+           "body": "提案三月版：检修期加派监护。"},
+          {"number": "SOP-CURL-PROP-001", "base_revision": 1,
+           "valid_start": "2026-03-10T00:00:00Z",
+           "valid_end":   "2026-03-20T00:00:00Z",
+           "body": "提案三月中：全套防割装备。"}
+        ]
+      }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+echo "proposal id = $PROPOSAL_ID"
+
+# --- 46c. 提交人本人/无审核角色批准 -> 403 --------------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PROPOSAL_ID/approve" \
+  -H "Authorization: Bearer $TOKEN_ALICE"; echo
+
+# --- 46d. 另一具 approve 角色的值班员批准（空请求体） -> 200 --------------
+# 同一写事务内按当前版本链重验整批；通过后发布 r1/r2 并写入原审计批次。
+curl -sS -X POST "$BASE_URL/api/v1/correction-proposals/$PROPOSAL_ID/approve" \
+  -H "Authorization: Bearer $TOKEN_REVIEWER"; echo
+
+# --- 46e. 重复批准 -> 409 proposal_already_decided，状态不变 --------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PROPOSAL_ID/approve" \
+  -H "Authorization: Bearer $TOKEN_REVIEWER"; echo
+
+# --- 46f. 按编号查询：内容、状态、处理人与成功发布的版本 ------------------
+curl -sS "$BASE_URL/api/v1/correction-proposals/$PROPOSAL_ID" \
+  -H "Authorization: Bearer $TOKEN_ALICE"; echo
+
+# --- 47. 拒绝流程（终态：已拒绝不可批准） ---------------------------------
+REJECT_ID=$(curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dev-token-bob-2026' \
+  -d '{
+        "items": [
+          {"number": "SOP-CURL-PROP-001", "base_revision": 0,
+           "valid_start": "2026-05-01T00:00:00Z",
+           "valid_end":   "2026-06-01T00:00:00Z",
+           "body": "五月提案，将被拒绝。"}
+        ]
+      }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+# 47a. 拒绝（可带 reason；请求体也可完全为空）
+curl -sS -X POST "$BASE_URL/api/v1/correction-proposals/$REJECT_ID/reject" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN_REVIEWER" \
+  -d '{"reason": "依据的基版区间需要再核对"}'; echo
+# 47b. 已拒绝提案再批准 -> 409
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$REJECT_ID/approve" \
+  -H "Authorization: Bearer $TOKEN_REVIEWER"; echo
+
+# --- 48. 批准时按当前版本链重验：等待期间区间变化 -> 冲突原因+位置 ---------
+WAIT_ID=$(curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dev-token-carol-2026' \
+  -d '{
+        "items": [
+          {"number": "SOP-CURL-PROP-001", "base_revision": 0,
+           "valid_start": "2026-10-01T00:00:00Z",
+           "valid_end":   "2026-11-01T00:00:00Z",
+           "body": "十月提案：等待期间区间将被抢占。"}
+        ]
+      }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+# 另一值班员走既有直接更正接口抢先占用同一区间（无需凭证）
+curl -sS -o /dev/null -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-CURL-PROP-001", "base_revision": 0,
+       "valid_start": "2026-10-01T00:00:00Z",
+       "valid_end":   "2026-11-01T00:00:00Z",
+       "body": "直接更正抢先发布。"}'
+# 批准 -> 409 expired_base_version（details.index=0），提案仍 pending
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$WAIT_ID/approve" \
+  -H "Authorization: Bearer $TOKEN_REVIEWER"; echo
+curl -sS "$BASE_URL/api/v1/correction-proposals/$WAIT_ID" \
+  -H "Authorization: Bearer $TOKEN_REVIEWER"; echo

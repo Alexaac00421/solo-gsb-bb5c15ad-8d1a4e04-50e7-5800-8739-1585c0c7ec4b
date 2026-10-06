@@ -38,6 +38,7 @@ def reset_db() -> None:
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
             "DELETE FROM audit_events; DELETE FROM audit_batches; "
+            "DELETE FROM correction_proposals; "
             "DELETE FROM prerequisites; "
             "DELETE FROM package_items; DELETE FROM packages; "
             "DELETE FROM withdrawals; "
@@ -2028,6 +2029,356 @@ class CorrectionPreviewTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "expired_base_version")
 
 
+def _operator(name: str, *roles: str):
+    return SimpleNamespace(name=name, roles=frozenset(roles))
+
+
+ALICE = _operator("alice", "submit")
+BOB = _operator("bob", "submit")
+REVIEWER = _operator("reviewer", "approve")
+BOTH = _operator("both", "submit", "approve")
+
+
+class CorrectionProposalTests(unittest.TestCase):
+    """待审更正提案：提交留档、批准事务内重验发布、拒绝终态、查询。"""
+
+    def setUp(self):
+        reset_db()
+        release("PR-1", body="初版", prerequisites=["PR-PRE"])
+
+    def _submit(self, operator=ALICE, *items_):
+        return service.create_correction_proposal(list(items_), operator)
+
+    def _approve(self, pid, operator=REVIEWER, reason=None):
+        return service.decide_correction_proposal(
+            pid, operator, "approved", reason)
+
+    def _reject(self, pid, operator=REVIEWER, reason=None):
+        return service.decide_correction_proposal(
+            pid, operator, "rejected", reason)
+
+    def test_submit_saves_immutable_pending_proposal_without_version(self):
+        before_history = service.list_history("PR-1")
+        res = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))
+        self.assertEqual(res["status"], "pending")
+        self.assertRegex(res["id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["submitted_by"], "alice")
+        self.assertTrue(res["submitted_at"].endswith("Z"))
+        self.assertIsNone(res["reviewed_by"])
+        self.assertIsNone(res["reviewed_at"])
+        self.assertIsNone(res["review_reason"])
+        self.assertIsNone(res["published_at"])
+        self.assertIsNone(res["published_batch_seq"])
+        self.assertIsNone(res["published_items"])
+        # 条目原样留档（含"省略 prerequisites"的 null 语义）
+        it = res["items"][0]
+        self.assertEqual(it["number"], "PR-1")
+        self.assertEqual(it["base_revision"], 0)
+        self.assertEqual(it["valid_start"], t2)
+        self.assertEqual(it["valid_end"], t3)
+        self.assertEqual(it["body"], "三月版")
+        self.assertIsNone(it["prerequisites"])
+        # 不占版本号、不写历史、不产生**新的**审计事件（setUp 已发布 release）
+        self.assertEqual(service.list_history("PR-1"), before_history)
+        feed = service.read_change_feed(None, 100)
+        self.assertEqual(
+            [(e["operation"], e["number"]) for e in feed["events"]],
+            [("release", "PR-1")])
+
+    def test_submit_keeps_explicit_prerequisite_field(self):
+        res = self._submit(ALICE, item("PR-1", "x", t2, t3, base=0,
+                                       prerequisites=[]))
+        self.assertEqual(res["items"][0]["prerequisites"], [])
+        res2 = self._submit(ALICE, item("PR-1", "y", t3, t4, base=0,
+                                        prerequisites=["PR-OTHER"]))
+        self.assertEqual(res2["items"][0]["prerequisites"], ["PR-OTHER"])
+
+    def test_submit_batch_content_preserved_in_order(self):
+        res = self._submit(
+            ALICE,
+            item("PR-1", "r1", t2, t4, base=0),
+            item("PR-1", "r2", t3, t4, base=1))
+        self.assertEqual(res["count"], 2)
+        self.assertEqual([(i["base_revision"], i["body"]) for i in res["items"]],
+                         [(0, "r1"), (1, "r2")])
+        # 仍不占版本号
+        self.assertEqual(service.list_history("PR-1")["count"], 1)
+
+    def test_approve_publishes_versions_and_audit_batch(self):
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        res = self._approve(pid)
+        self.assertEqual(res["status"], "approved")
+        self.assertEqual(res["reviewed_by"], "reviewer")
+        self.assertTrue(res["reviewed_at"].endswith("Z"))
+        self.assertEqual(res["published_at"], res["reviewed_at"])
+        self.assertIsInstance(res["published_batch_seq"], int)
+        published = res["published_items"]
+        self.assertEqual(len(published), 1)
+        v = published[0]
+        self.assertEqual(v["number"], "PR-1")
+        self.assertEqual(v["revision"], 1)               # 批准时才占版本号
+        self.assertEqual(v["supersedes_revision"], 0)
+        self.assertEqual(v["body"], "三月版")
+        self.assertEqual(v["prerequisites"], ["PR-PRE"])  # 省略继承
+        self.assertEqual(v["published_at"], res["published_at"])
+        # 历史已发布；审计日志含该 correction 事件（原批次表）
+        self.assertEqual(service.list_history("PR-1")["count"], 2)
+        events = service.read_change_feed(None, 100)["events"]
+        self.assertEqual([(e["operation"], e["number"], e["revision"])
+                          for e in events],
+                         [("release", "PR-1", 0), ("correction", "PR-1", 1)])
+        self.assertEqual(events[1]["batch_seq"], res["published_batch_seq"])
+        self.assertEqual(events[1]["event_time"], res["published_at"])
+
+    def test_approve_applies_batch_in_order_later_references_earlier(self):
+        pid = self._submit(
+            ALICE,
+            item("PR-1", "r1", t2, t4, base=0),
+            item("PR-1", "r2", t3, t4, base=1))["id"]
+        res = self._approve(pid)
+        self.assertEqual([v["revision"] for v in res["published_items"]], [1, 2])
+        self.assertEqual(numbers_at(iso(_T + timedelta(days=75)),
+                                    future)["PR-1"]["body"], "r2")
+
+    def test_approve_revalidates_against_current_chain_conflict_keeps_pending(self):
+        pid = self._submit(ALICE, item("PR-1", "提案三月版", t2, t3,
+                                       base=0))["id"]
+        # 等待期间另一值班员通过**直接更正**接口抢先占用同一区间
+        correct("PR-1", 0, t2, t3, "抢先发布")
+        with self.assertRaises(DomainError) as ctx:
+            self._approve(pid)
+        self.assertEqual(ctx.exception.code, "expired_base_version")
+        self.assertEqual(ctx.exception.http_status, 409)
+        # 提案仍待审，未留下部分版本/审计事件
+        got = service.get_correction_proposal(pid)
+        self.assertEqual(got["status"], "pending")
+        self.assertIsNone(got["reviewed_by"])
+        self.assertIsNone(got["published_at"])
+        self.assertIsNone(got["published_items"])
+        self.assertEqual(service.list_history("PR-1")["count"], 2)  # 只有直接更正
+        self.assertEqual(len(service.read_change_feed(None, 100)["events"]), 2)
+        # 冲突原因带条目位置（index=0）
+        self.assertEqual(ctx.exception.details["index"], 0)
+        # 冲突消除（撤回抢占的更正，区间恢复）后再次批准成功
+        withdraw("PR-1", 1)
+        res = self._approve(pid)
+        self.assertEqual(res["status"], "approved")
+        self.assertEqual([v["revision"] for v in res["published_items"]], [2])
+
+    def test_approve_conflict_index_points_at_failing_batch_item(self):
+        # 第 1 条合法；第 2 条引用不存在的规程 -> index=1，整批不留版本
+        pid = self._submit(
+            ALICE,
+            item("PR-1", "ok", t2, t3, base=0),
+            item("PR-NOPE", "bad", t2, t3, base=0))["id"]
+        with self.assertRaises(DomainError) as ctx:
+            self._approve(pid)
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(ctx.exception.details["index"], 1)
+        got = service.get_correction_proposal(pid)
+        self.assertEqual(got["status"], "pending")
+        self.assertEqual(service.list_history("PR-1")["count"], 1)
+        self.assertEqual(
+            [(e["operation"], e["number"])
+             for e in service.read_change_feed(None, 100)["events"]],
+            [("release", "PR-1")])
+
+    def test_approve_invalid_interval_uses_existing_error(self):
+        pid = self._submit(
+            ALICE, item("PR-1", "x", t2, future, base=0))["id"]
+        with self.assertRaises(DomainError) as ctx:
+            self._approve(pid)
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+        self.assertEqual(ctx.exception.details["index"], 0)
+        self.assertEqual(service.get_correction_proposal(pid)["status"],
+                         "pending")
+
+    def test_reject_is_terminal_no_version_no_audit(self):
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        res = self._reject(pid, reason="依据版本有误")
+        self.assertEqual(res["status"], "rejected")
+        self.assertEqual(res["reviewed_by"], "reviewer")
+        self.assertTrue(res["reviewed_at"].endswith("Z"))
+        self.assertEqual(res["review_reason"], "依据版本有误")
+        self.assertIsNone(res["published_at"])
+        self.assertIsNone(res["published_items"])
+        self.assertEqual(service.list_history("PR-1")["count"], 1)
+        self.assertEqual(
+            [(e["operation"], e["number"])
+             for e in service.read_change_feed(None, 100)["events"]],
+            [("release", "PR-1")])
+        # 已拒绝提案不可批准 -> 409，状态不变
+        with self.assertRaises(DomainError) as ctx:
+            self._approve(pid)
+        self.assertEqual(ctx.exception.code, "proposal_already_decided")
+        self.assertEqual(ctx.exception.http_status, 409)
+        self.assertEqual(ctx.exception.details["status"], "rejected")
+        got = service.get_correction_proposal(pid)
+        self.assertEqual(got["status"], "rejected")
+        self.assertIsNone(got["published_at"])
+        # 再次拒绝同样被当作重复处理拒绝
+        with self.assertRaises(DomainError) as ctx:
+            self._reject(pid)
+        self.assertEqual(ctx.exception.code, "proposal_already_decided")
+
+    def test_approved_proposal_cannot_be_processed_again(self):
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        self._approve(pid)
+        with self.assertRaises(DomainError) as ctx:
+            self._approve(pid)
+        self.assertEqual(ctx.exception.code, "proposal_already_decided")
+        self.assertEqual(ctx.exception.details["status"], "approved")
+        with self.assertRaises(DomainError) as ctx:
+            self._reject(pid)
+        self.assertEqual(ctx.exception.code, "proposal_already_decided")
+        # 重复处理未产生第二审计批次（仍只有 release + 一次 correction）
+        self.assertEqual(len(service.read_change_feed(None, 100)["events"]), 2)
+
+    def test_get_proposal_returns_full_view(self):
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        got = service.get_correction_proposal(pid)
+        self.assertEqual(got["id"], pid)
+        self.assertEqual(got["status"], "pending")
+        self.assertEqual(got["submitted_by"], "alice")
+        self.assertEqual(got["items"][0]["body"], "三月版")
+        self._approve(pid, reason="同意")
+        got = service.get_correction_proposal(pid)
+        self.assertEqual(got["status"], "approved")
+        self.assertEqual(got["review_reason"], "同意")
+        self.assertEqual(got["published_items"][0]["revision"], 1)
+
+    def test_get_missing_proposal_is_404(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.get_correction_proposal("deadbeefdeadbeefdeadbeefdeadbeef")
+        self.assertEqual(ctx.exception.code, "proposal_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        with self.assertRaises(DomainError):
+            service.decide_correction_proposal("  ", REVIEWER, "rejected", None)
+
+    def test_submitter_cannot_review_own_proposal(self):
+        pid = self._submit(BOTH, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        with self.assertRaises(DomainError) as ctx:
+            self._approve(pid, operator=BOTH)
+        self.assertEqual(ctx.exception.code, "reviewer_is_submitter")
+        self.assertEqual(ctx.exception.http_status, 403)
+        with self.assertRaises(DomainError) as ctx:
+            self._reject(pid, operator=BOTH)
+        self.assertEqual(ctx.exception.code, "reviewer_is_submitter")
+        # 提案状态不变
+        self.assertEqual(service.get_correction_proposal(pid)["status"],
+                         "pending")
+
+    def test_different_submitters_and_reviewer_flow(self):
+        # alice 提交、bob 也提交，reviewer 各自审核
+        p1 = self._submit(ALICE, item("PR-1", "alice 三月", t2,
+                                      iso(_T + timedelta(days=40)), base=0))["id"]
+        self._approve(p1)
+        p2 = self._submit(BOB, item("PR-1", "bob 五月",
+                                    iso(_T + timedelta(days=120)),
+                                    iso(_T + timedelta(days=140)), base=0))["id"]
+        self._reject(p2, reason="bob 暂不发布")
+        self.assertEqual(service.get_correction_proposal(p1)["status"],
+                         "approved")
+        self.assertEqual(service.get_correction_proposal(p2)["status"],
+                         "rejected")
+    def test_concurrent_approve_succeeds_at_most_once(self):
+        import threading
+
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        results: list[dict] = []
+        errors_seen: list[DomainError] = []
+        barrier = threading.Barrier(2)
+
+        def do_approve() -> None:
+            try:
+                barrier.wait()
+                results.append(self._approve(pid))
+            except DomainError as exc:
+                errors_seen.append(exc)
+
+        threads = [threading.Thread(target=do_approve) for _ in range(2)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors_seen), 1)
+        self.assertEqual(errors_seen[0].code, "proposal_already_decided")
+        self.assertEqual(service.list_history("PR-1")["count"], 2)
+        self.assertEqual(len(service.read_change_feed(None, 100)["events"]), 2)
+
+    def test_concurrent_approve_and_reject_exactly_one_wins(self):
+        import threading
+
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        outcomes: list[str] = []
+        barrier = threading.Barrier(2)
+
+        def do(decision: str) -> None:
+            try:
+                barrier.wait()
+                service.decide_correction_proposal(
+                    pid, REVIEWER, decision, None)
+                outcomes.append(decision)
+            except DomainError:
+                outcomes.append("conflict:" + decision)
+
+        th_approve = threading.Thread(target=do, args=("approved",))
+        th_reject = threading.Thread(target=do, args=("rejected",))
+        th_approve.start(); th_reject.start()
+        th_approve.join(); th_reject.join()
+        self.assertEqual(len([o for o in outcomes if not o.startswith("conflict")]),
+                         1)
+        final = service.get_correction_proposal(pid)["status"]
+        winner = [o for o in outcomes if not o.startswith("conflict")][0]
+        self.assertEqual(final, winner)
+        self.assertIn(final, ("approved", "rejected"))
+        # 批准获胜时恰好一份版本；拒绝获胜时没有版本
+        self.assertEqual(service.list_history("PR-1")["count"],
+                         2 if final == "approved" else 1)
+
+    def test_proposal_does_not_consume_revision_on_reject_then_direct(self):
+        pid = self._submit(ALICE, item("PR-1", "提案版", t2, t3, base=0))["id"]
+        self._reject(pid)
+        # 直接更正拿到的仍是 r1（被拒提案未占号）
+        res = correct("PR-1", 0, t2, t3, "直接版")
+        self.assertEqual(res["items"][0]["revision"], 1)
+
+    def test_reason_blank_treated_as_none(self):
+        pid = self._submit(ALICE, item("PR-1", "三月版", t2, t3, base=0))["id"]
+        res = self._reject(pid, reason="   ")
+        self.assertIsNone(res["review_reason"])
+
+
+class AuthConfigTests(unittest.TestCase):
+    """本地值班员凭证解析与 Bearer token 识别。"""
+
+    def test_default_operators_loaded(self):
+        from app.auth import authenticate
+        ops = settings.operators
+        self.assertIn("submit", ops["dev-token-alice-2026"].roles)
+        self.assertIn("approve", ops["dev-token-reviewer-2026"].roles)
+        self.assertNotIn("approve", ops["dev-token-alice-2026"].roles)
+        self.assertIsNone(authenticate(None, ops))
+        self.assertIsNone(authenticate("Bearer nope", ops))
+        self.assertIsNone(authenticate("Basic dev-token-alice-2026", ops))
+        op = authenticate("Bearer dev-token-alice-2026", ops)
+        self.assertEqual(op.name, "duty-alice")
+        self.assertTrue(op.can("submit"))
+
+    def test_parse_operators_validation(self):
+        from app.auth import parse_operators
+        ops = parse_operators("a:submit:tok-a;r:submit,approve:tok-r")
+        self.assertEqual(ops["tok-a"].name, "a")
+        self.assertEqual(
+            {"submit", "approve"}, set(ops["tok-r"].roles))
+        for bad in ("", "a:submit:", "a:submit:tok;b:approve:tok",
+                    "a:norole:tok", "garbage", "a:submit:tok;a:approve:tok2"):
+            with self.assertRaises(ValueError):
+                parse_operators(bad)
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -2946,6 +3297,233 @@ class ApiTests(unittest.TestCase):
             r = c.get("/api/v1/audit/events", params={"limit": bad})
             self.assertEqual(r.status_code, 422, bad)
             self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
+
+
+class CorrectionProposalHttpTests(unittest.TestCase):
+    """待审更正提案 HTTP 层：Bearer 凭证、角色、审核人分离、完整批准流程。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from fastapi.testclient import TestClient
+            from app.main import app
+        except Exception:
+            raise unittest.SkipTest("fastapi/httpx 未安装，跳过 API 测试")
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        reset_db()
+
+    def _n(self):
+        CorrectionProposalHttpTests._s = getattr(
+            CorrectionProposalHttpTests, "_s", 0) + 1
+        return f"PROP-API-{id(self)}-{CorrectionProposalHttpTests._s}"
+
+    H = {
+        "alice": {"Authorization": "Bearer dev-token-alice-2026"},
+        "bob": {"Authorization": "Bearer dev-token-bob-2026"},
+        "supervisor": {"Authorization": "Bearer dev-token-supervisor-2026"},
+        "reviewer": {"Authorization": "Bearer dev-token-reviewer-2026"},
+    }
+
+    def _release(self, n):
+        r = self.client.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        self.assertEqual(r.status_code, 201, r.text)
+
+    def _item(self, n, body="提案三月版", start=t2, end=t3, base=0):
+        return {"number": n, "base_revision": base,
+                "valid_start": start, "valid_end": end, "body": body}
+
+    def test_full_proposal_flow_over_http(self):
+        c = self.client
+        n = self._n()
+        self._release(n)
+
+        # 无凭证 -> 401
+        r = c.post("/api/v1/correction-proposals",
+                   json={"items": [self._item(n)]})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["error"]["code"], "invalid_credentials")
+        # 错误 token -> 401
+        r = c.post("/api/v1/correction-proposals",
+                   headers={"Authorization": "Bearer wrong-token"},
+                   json={"items": [self._item(n)]})
+        self.assertEqual(r.status_code, 401)
+        # 审核人 token 无 submit 角色 -> 403
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["reviewer"],
+                   json={"items": [self._item(n)]})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "insufficient_role")
+
+        # alice 提交 -> 201 pending，条目原样返回
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["alice"],
+                   json={"items": [self._item(n)]})
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        pid = body["id"]
+        self.assertEqual(body["status"], "pending")
+        self.assertEqual(body["submitted_by"], "duty-alice")
+        self.assertIsNone(body["reviewed_by"])
+        self.assertIsNone(body["published_items"])
+        self.assertEqual(body["items"][0]["body"], "提案三月版")
+
+        # 未授权查询 -> 401；有效身份可查
+        self.assertEqual(c.get(f"/api/v1/correction-proposals/{pid}").status_code,
+                         401)
+        r = c.get(f"/api/v1/correction-proposals/{pid}",
+                  headers=self.H["bob"])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "pending")
+
+        # 提交人本人不能审核：supervisor 兼具两种角色，提交后自行批准/拒绝
+        # 均 -> 403 reviewer_is_submitter（角色已满足，卡在同人校验）。
+        # 使用另一区间（t3..t4），不与 alice 待审提案的 t2..t3 互相抢占。
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["supervisor"],
+                   json={"items": [self._item(n, body="自提自审",
+                                              start=t3, end=t4)]})
+        self.assertEqual(r.status_code, 201, r.text)
+        own_pid = r.json()["id"]
+        r = c.post(f"/api/v1/correction-proposals/{own_pid}/approve",
+                   headers=self.H["supervisor"])
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "reviewer_is_submitter")
+        r = c.post(f"/api/v1/correction-proposals/{own_pid}/reject",
+                   headers=self.H["supervisor"])
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "reviewer_is_submitter")
+
+        # reviewer 批准 alice 的提案（空请求体允许）-> 200 approved，发布版本号
+        r = c.post(f"/api/v1/correction-proposals/{pid}/approve",
+                   headers=self.H["reviewer"])
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["status"], "approved")
+        self.assertEqual(body["reviewed_by"], "duty-reviewer")
+        self.assertEqual(body["published_items"][0]["revision"], 1)
+        self.assertTrue(body["published_at"].endswith("Z"))
+
+        # 重复批准/拒绝 -> 409 状态不变
+        r = c.post(f"/api/v1/correction-proposals/{pid}/approve",
+                   headers=self.H["reviewer"])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"],
+                         "proposal_already_decided")
+        r = c.post(f"/api/v1/correction-proposals/{pid}/reject",
+                   headers=self.H["reviewer"], json={"reason": "太晚了"})
+        self.assertEqual(r.status_code, 409)
+
+        # 版本确实发布；审计日志含 correction 批次
+        r = c.get("/api/v1/effective", params={"work_time": t2})
+        self.assertEqual([i for i in r.json()["items"] if i["number"] == n][0]
+                         ["body"], "提案三月版")
+        r = c.get("/api/v1/audit/events", params={"limit": 10})
+        self.assertIn("correction", [e["operation"] for e in r.json()["events"]])
+
+        # alice 的提案落定后，另一审核人可以正常处理 supervisor 的待审提案
+        r = c.post(f"/api/v1/correction-proposals/{own_pid}/reject",
+                   headers=self.H["reviewer"], json={"reason": "必须他人审核"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+
+        # 已列入根索引
+        self.assertIn("POST /api/v1/correction-proposals",
+                      c.get("/").json()["endpoints"])
+
+    def test_reject_flow_and_terminal_over_http(self):
+        c = self.client
+        n = self._n()
+        self._release(n)
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["bob"],
+                   json={"items": [self._item(n, body="待拒")]})
+        pid = r.json()["id"]
+        # 拒绝带 reason，空对象也合法
+        r = c.post(f"/api/v1/correction-proposals/{pid}/reject",
+                   headers=self.H["reviewer"], json={"reason": "依据有误"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+        self.assertEqual(r.json()["review_reason"], "依据有误")
+        self.assertIsNone(r.json()["published_items"])
+        # 已拒绝不可批准
+        r = c.post(f"/api/v1/correction-proposals/{pid}/approve",
+                   headers=self.H["reviewer"])
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["details"]["status"], "rejected")
+        # 历史无版本、审计无 correction
+        hist = c.get(f"/api/v1/procedures/{n}/history").json()
+        self.assertEqual([v["revision"] for v in hist["items"]], [0])
+
+    def test_approve_conflict_during_wait_keeps_pending_over_http(self):
+        c = self.client
+        n = self._n()
+        self._release(n)
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["alice"],
+                   json={"items": [self._item(n)]})
+        pid = r.json()["id"]
+        # 等待期间直接更正抢占区间（既有接口无需凭证）
+        r = c.post("/api/v1/corrections", json=self._item(n, body="抢先"))
+        self.assertEqual(r.status_code, 201)
+        # 批准 -> 409 现有冲突原因 + 条目位置，提案仍 pending
+        r = c.post(f"/api/v1/correction-proposals/{pid}/approve",
+                   headers=self.H["reviewer"])
+        self.assertEqual(r.status_code, 409)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "expired_base_version")
+        self.assertEqual(err["details"]["index"], 0)
+        got = c.get(f"/api/v1/correction-proposals/{pid}",
+                    headers=self.H["alice"]).json()
+        self.assertEqual(got["status"], "pending")
+        self.assertIsNone(got["published_items"])
+
+    def test_batch_proposal_approve_and_missing_proposal(self):
+        c = self.client
+        n = self._n()
+        self._release(n)
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["alice"],
+                   json={"items": [
+                       self._item(n, "r1", t2, t4, 0),
+                       self._item(n, "r2", t3, t4, 1),
+                   ]})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["count"], 2)
+        pid = r.json()["id"]
+        r = c.post(f"/api/v1/correction-proposals/{pid}/approve",
+                   headers=self.H["reviewer"])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([v["revision"] for v in r.json()["published_items"]],
+                         [1, 2])
+        # 不存在提案
+        r = c.get("/api/v1/correction-proposals/nope-nope-nope",
+                  headers=self.H["alice"])
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "proposal_not_found")
+        r = c.post("/api/v1/correction-proposals/nope-nope-nope/approve",
+                   headers=self.H["reviewer"])
+        self.assertEqual(r.status_code, 404)
+
+    def test_extra_fields_and_empty_items_rejected(self):
+        c = self.client
+        n = self._n()
+        self._release(n)
+        # 额外字段（如回填处理人/时刻）-> 422
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["alice"],
+                   json={"items": [self._item(n)], "submitted_by": "x"})
+        self.assertEqual(r.status_code, 422)
+        # 空 items -> 422
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["alice"], json={"items": []})
+        self.assertEqual(r.status_code, 422)
+        # 缺 items -> 422
+        r = c.post("/api/v1/correction-proposals",
+                   headers=self.H["alice"], json={})
+        self.assertEqual(r.status_code, 422)
 
 
 class AuditFeedTests(unittest.TestCase):
