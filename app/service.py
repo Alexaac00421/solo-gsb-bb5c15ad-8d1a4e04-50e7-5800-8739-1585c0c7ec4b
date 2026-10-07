@@ -88,16 +88,41 @@
 版本端点切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，并标出
 因撤回导致的恢复、区间外空档与版本切换；相邻段仅在整组结果完全相同时
 合并。编号不存在、时间非法或知悉时刻晚于当前时刻均拒绝；全程只读。
+
+待审更正提案（双人复核）
+------------------------
+值班员凭**本地配置的身份凭证**（见 :mod:`app.auth`，``SOP_OPERATORS``
+登记本）提交"待审更正"：内容沿用现有单条/批量更正的同一套字段
+（submit_correction_proposal）。服务把提案**原样、不可变**地保存，
+返回提案编号、状态与条目；提交只做条目形状校验、**不校验版本链、不占
+版本号、不写审计事件**。
+
+另一名具审核权限（review）的值班员可批准或拒绝
+（decide_correction_proposal）：提交人与审核人不得相同；身份无效
+（401）、权限不足（403）、重复处理或批准已拒绝提案（409）一律拒绝且
+**状态不变**。批准时在**同一条写事务**内按**当前**版本链用与直接更正
+逐行相同的 :func:`_apply_corrections` 重验整批（基版、区间、前置清单、
+同批顺序），通过才发布版本并写入**原有审计批次**；期间版本变化导致任一
+条非法时返回现有冲突原因与条目位置（``details.index``），事务回滚——
+提案仍待审，不留任何部分版本或审计事件。终态提案不可再处理（已拒绝不可
+批准）；并发批准至多成功一次（写锁 + 条件状态转移）。按编号查询
+（get_correction_proposal）返回提案内容、状态、提交人、处理人、处理
+时刻与成功发布的版本号。
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
+from typing import TYPE_CHECKING, Any
 
 from . import errors
 from .db import read_conn, read_snapshot, write_tx
 from .errors import DomainError
 from .time_utils import TimeParseError, now_canonical, parse_canonical
+
+if TYPE_CHECKING:
+    from .auth import Operator
 # ---------------------------------------------------------------- 服务端时钟
 
 # 写操作由全局锁串行化；时钟同样保证单调递增，避免连续两次发布落在同一微秒
@@ -608,7 +633,8 @@ def _in_memory_clone(conn: sqlite3.Connection) -> sqlite3.Connection:
         clone.executescript(_SCHEMA)
         tables = ["procedures", "versions", "withdrawals", "packages",
                   "package_items", "prerequisites",
-                  "audit_batches", "audit_events"]
+                  "audit_batches", "audit_events",
+                  "correction_proposals", "correction_proposal_items"]
         for table in tables:
             rows = conn.execute(f"SELECT * FROM {table}").fetchall()
             if not rows:
@@ -1851,3 +1877,249 @@ def review_package(package_id_raw: str, review_known_raw: str) -> dict:
             "count": len(items),
             "all_match": all_match,
             "items": items}
+
+
+# ------------------------------------------------------------ 待审更正提案
+
+
+class _StoredItem:
+    """提案条目在事务间传递的不可变载体（与 schemas.CorrectionItem 同字段）。
+
+    ``prerequisites`` 保留 None（请求省略）语义，批准应用更正时由
+    :func:`_apply_corrections` 按"省略继承 / 显式清空 / 显式替换"处理。
+    """
+
+    __slots__ = ("number", "base_revision", "valid_start", "valid_end",
+                 "body", "prerequisites")
+
+    def __init__(self, number: str, base_revision: int, valid_start: str,
+                 valid_end: str, body: str,
+                 prerequisites: list[str] | None):
+        self.number = number
+        self.base_revision = base_revision
+        self.valid_start = valid_start
+        self.valid_end = valid_end
+        self.body = body
+        self.prerequisites = prerequisites
+
+
+def _normalize_proposal_items(items: list) -> list[_StoredItem]:
+    """提案提交时的**形状**校验：沿用现有更正字段的逐项规范化。
+
+    故意不触碰版本链：编号/基版存在性、剩余区间、同批重叠等"随版本变化"
+    的校验全部留到批准时按当时状态重验（提案因此可以先于区间空闲而提交）。
+    """
+    normalized: list[_StoredItem] = []
+    for i, item in enumerate(items):
+        number = _clean_number(item.number, i)
+        body = _clean_text(item.body, "body", i)
+        start, end = _validated_interval(item.valid_start, item.valid_end, i)
+        prerequisites = _clean_prerequisites(
+            getattr(item, "prerequisites", None), i)
+        normalized.append(_StoredItem(number, int(item.base_revision),
+                                      start, end, body, prerequisites))
+    if not normalized:
+        raise DomainError("validation_error",
+                          "待审更正提案的条目不能为空：items 至少包含一条更正",
+                          422, {"field": "items"})
+    return normalized
+
+
+def _proposal_item_payload(row: sqlite3.Row) -> dict:
+    """提案条目对外呈现：保留"省略（null）/ 显式列表"的原始提交形态。
+
+    批准成功时追加该条目实际发布的版本号 ``published_revision``；
+    pending/rejected 提案该字段为 null（不占版本号）。
+    """
+    out: dict[str, Any] = {
+        "index": row["position"],
+        "number": row["number"],
+        "base_revision": row["base_revision"],
+        "valid_start": row["valid_start"],
+        "valid_end": row["valid_end"],
+        "body": row["body"],
+        "prerequisites": (json.loads(row["prereq_json"])
+                          if row["prereq_mode"] == "explicit" else None),
+    }
+    if row["status"] == "approved":
+        out["published_revision"] = row["published_revision"]
+    return out
+
+
+def _proposal_response(conn: sqlite3.Connection,
+                       proposal_row: sqlite3.Row) -> dict:
+    """组装提案查询/提交/审核统一响应（读已在调用方事务/快照内完成）。"""
+    items = conn.execute(
+        "SELECT i.*, p.status AS status FROM correction_proposal_items i "
+        "JOIN correction_proposals p ON p.id = i.proposal_id "
+        "WHERE i.proposal_id = ? ORDER BY i.position",
+        (proposal_row["id"],)).fetchall()
+    return {
+        "id": proposal_row["id"],
+        "status": proposal_row["status"],
+        "submitted_at": proposal_row["submitted_at"],
+        "submitter": {"operator_id": proposal_row["submitter_id"],
+                      "name": proposal_row["submitter_name"]},
+        "decided_at": proposal_row["decided_at"],
+        "reviewer": (None if proposal_row["decided_by"] is None
+                     else {"operator_id": proposal_row["decided_by"],
+                           "name": proposal_row["decided_by_name"]}),
+        "reason": proposal_row["decision_reason"],
+        "count": proposal_row["item_count"],
+        "items": [_proposal_item_payload(r) for r in items],
+    }
+
+
+def submit_correction_proposal(items: list, operator: "Operator") -> dict:
+    """值班员提交待审更正提案；提案原样保存、不可变。
+
+    内容沿用现有单条/批量更正字段（编号、被替代版本、子区间、正文、可选
+    前置清单），提交时只做与历史无关的形状校验；**不校验版本链、不占版本
+    号、不写审计批次**。成功返回提案编号（uuid）、状态 ``pending`` 与条目。
+    """
+    normalized = _normalize_proposal_items(items)
+    proposal_id = uuid.uuid4().hex
+    submitted_at = _server_now()
+    with write_tx() as conn:
+        conn.execute(
+            "INSERT INTO correction_proposals (id, status, submitter_id, "
+            "submitter_name, submitted_at, item_count) "
+            "VALUES (?, 'pending', ?, ?, ?, ?)",
+            (proposal_id, operator.operator_id, operator.name,
+             submitted_at, len(normalized)))
+        for pos, it in enumerate(normalized):
+            mode = "inherit" if it.prerequisites is None else "explicit"
+            prereq_json = (None if it.prerequisites is None
+                           else json.dumps(it.prerequisites,
+                                           ensure_ascii=False))
+            conn.execute(
+                "INSERT INTO correction_proposal_items (proposal_id, "
+                "position, number, base_revision, body, valid_start, "
+                "valid_end, prereq_mode, prereq_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (proposal_id, pos, it.number, it.base_revision, it.body,
+                 it.valid_start, it.valid_end, mode, prereq_json))
+        row = conn.execute(
+            "SELECT * FROM correction_proposals WHERE id = ?",
+            (proposal_id,)).fetchone()
+        return _proposal_response(conn, row)
+
+
+def decide_correction_proposal(proposal_id_raw: str, decision_raw: str,
+                               reason: str | None,
+                               reviewer: "Operator") -> dict:
+    """另一名具审核权限的值班员批准（approve）或拒绝（reject）提案。
+
+    调用方（路由层）已凭凭证识别身份并要求 review 角色；提交人与审核人
+    不得相同。全部处理在**同一条 BEGIN IMMEDIATE 写事务**内完成：
+
+    * **拒绝**：记录处理人、处理时刻（服务端时钟）与可选原因，状态置
+      ``rejected``；不发布任何版本、不写审计事件。
+    * **批准**：按**当前版本链**用与直接更正逐行相同的
+      :func:`_apply_corrections` 重验整批（基版存在/未撤回、子区间落在
+      剩余生效区间、前置清单省略继承/显式清空、同批顺序与后项引用前项），
+      任一非法即抛出与直接更正完全相同的领域错误（``details.index`` 指
+      条目位置），事务整体回滚——提案仍停在 ``pending``，不留任何部分
+      版本或审计事件；全部合法时发布版本、写入**原有审计批次**（一个
+      批次，事件按条目顺序），再把提案条件转移为 ``approved`` 并回填各
+      条目成功发布的版本号。
+
+    终态提案重复处理 -> 409 proposal_already_decided（批准已拒绝提案 ->
+    409 rejected_proposal_not_approvable），状态不变；并发批准经写锁串行
+    且状态转移带 ``WHERE status='pending'`` 条件，至多一次成功。
+    """
+    decision = (decision_raw or "").strip().lower()
+    if decision not in ("approve", "reject"):
+        raise DomainError(
+            "validation_error",
+            f"审核决定非法：decision 必须是 approve 或 reject，实际为 "
+            f"{decision_raw!r}", http_status=422,
+            details={"field": "decision", "value": decision_raw})
+    if reason is not None:
+        reason = reason.strip() or None
+
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM correction_proposals WHERE id = ?",
+            (proposal_id_raw.strip(),)).fetchone()
+        if row is None:
+            raise errors.proposal_not_found(proposal_id_raw.strip())
+        if row["status"] != "pending":
+            # 终态：批准一个已拒绝提案给出专门原因，其余重复处理统一报错。
+            if decision == "approve" and row["status"] == "rejected":
+                raise errors.rejected_proposal_not_approvable(
+                    row["id"], row["decided_by"], row["decided_at"])
+            raise errors.proposal_already_decided(
+                row["id"], row["status"], row["decided_by"], row["decided_at"])
+        if row["submitter_id"] == reviewer.operator_id:
+            raise errors.submitter_cannot_review(reviewer.operator_id)
+
+        decided_at = _server_now()
+        item_rows = conn.execute(
+            "SELECT * FROM correction_proposal_items WHERE proposal_id = ? "
+            "ORDER BY position", (row["id"],)).fetchall()
+
+        if decision == "reject":
+            cur = conn.execute(
+                "UPDATE correction_proposals SET status = 'rejected', "
+                "decided_by = ?, decided_by_name = ?, decided_at = ?, "
+                "decision_reason = ? WHERE id = ? AND status = 'pending'",
+                (reviewer.operator_id, reviewer.name, decided_at,
+                 reason, row["id"]))
+            if cur.rowcount != 1:                  # 并发下已被他人处理
+                raise errors.proposal_already_decided(
+                    row["id"], "approved", reviewer.operator_id, decided_at)
+            updated = conn.execute(
+                "SELECT * FROM correction_proposals WHERE id = ?",
+                (row["id"],)).fetchone()
+            return _proposal_response(conn, updated)
+
+        # approve：把原样留档条目还原为应用逻辑的输入载体，按当前版本链
+        # 重验整批（非法即抛错、事务回滚，提案保持 pending）。
+        stored = [
+            _StoredItem(
+                r["number"], r["base_revision"], r["valid_start"],
+                r["valid_end"], r["body"],
+                (json.loads(r["prereq_json"])
+                 if r["prereq_mode"] == "explicit" else None))
+            for r in item_rows]
+        applied = _apply_corrections(conn, stored, decided_at)
+        # 版本发布与原有审计批次在同一事务：要么整批可见，要么全部回滚。
+        _insert_audit_batch(conn, [
+            {"operation": "correction", "number": e["number"],
+             "revision": e["revision"], "event_time": decided_at,
+             "version_id": e["_version_id"]}
+            for e in applied])
+        for e in applied:
+            conn.execute(
+                "UPDATE correction_proposal_items SET published_revision = ? "
+                "WHERE proposal_id = ? AND position = ?",
+                (e["revision"], row["id"], e["index"]))
+        # 条件状态转移：并发批准至多一次成功。
+        cur = conn.execute(
+            "UPDATE correction_proposals SET status = 'approved', "
+            "decided_by = ?, decided_by_name = ?, decided_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (reviewer.operator_id, reviewer.name, decided_at, row["id"]))
+        if cur.rowcount != 1:
+            # 理论上写锁已串行化；保留为最终防线（回滚全部已发布版本）。
+            raise errors.proposal_already_decided(
+                row["id"], "approved", reviewer.operator_id, decided_at)
+        updated = conn.execute(
+            "SELECT * FROM correction_proposals WHERE id = ?",
+            (row["id"],)).fetchone()
+        return _proposal_response(conn, updated)
+
+
+def get_correction_proposal(proposal_id_raw: str) -> dict:
+    """按编号查询待审更正提案：内容、状态、提交人、处理人、处理时刻，
+    以及批准成功后各条目实际发布的版本号。不存在 -> 404 proposal_not_found。
+    """
+    proposal_id = proposal_id_raw.strip()
+    with read_snapshot() as conn:
+        row = conn.execute(
+            "SELECT * FROM correction_proposals WHERE id = ?",
+            (proposal_id,)).fetchone()
+        if row is None:
+            raise errors.proposal_not_found(proposal_id)
+        return _proposal_response(conn, row)

@@ -50,6 +50,15 @@
   版本号、正文或缺口，并标出因撤回导致的恢复、区间外空档与版本切换；
   相邻段仅在整组结果完全相同时合并；编号不存在、时间非法或知悉时刻晚于
   当前时刻均拒绝，全程只读、不改变历史。
+- **待审更正提案（双人复核）**：值班员凭**本地配置的身份凭证**提交待审
+  更正，内容沿用现有单条或批量更正字段；服务保存**不可变提案**并返回编号、
+  状态和条目，**不占版本号**。另一名具审核权限的值班员可批准或拒绝，
+  提交人与审核人不得相同；身份无效、权限不足或重复处理一律拒绝且状态不变。
+  批准时在**同一写事务**内按**当前版本链**重验整批的基版、区间、前置清单
+  及同批顺序，再发布版本并写入**原有审计批次**；期间版本变化导致任一条非法
+  时返回现有冲突原因和条目位置，提案仍待审、不留下部分版本或审计事件。
+  已拒绝提案不可批准，并发批准至多成功一次。按编号查询返回提案内容、状态、
+  提交人、处理人、处理时刻与成功发布的版本号。
 
 更正只新增行、不改写任何旧行（append-only）；撤回同样只向 `withdrawals`
 表追加一行事件、从不删除或改写版本行，因此"撤回前知悉时刻的查询结果"天然保持原样。
@@ -104,6 +113,44 @@ SOP_DB_PATH=./sop.db uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `SOP_HOST` | `0.0.0.0` | HTTP 监听地址 |
 | `SOP_PORT` | `8080` | **容器内**监听端口 |
 | `SOP_BUSY_TIMEOUT_MS` | `5000` | SQLite 写锁等待毫秒数 |
+| `SOP_OPERATORS` | 内置演示登记本（见下） | 本地值班员凭证登记本：`工号:姓名:token:角色`，多人用 `;` 分隔、角色用 `,` 分隔；角色为 `submit` / `review` |
+
+### 值班员凭证配置（本轮新增）
+
+待审更正接口（第 13 节）要求值班员出示**本地登记**的身份凭证，凭证不经
+任何外部服务。登记本由环境变量 `SOP_OPERATORS` 提供，格式为：
+
+```
+工号:姓名:token:角色清单;工号:姓名:token:角色清单;...
+```
+
+- 每位值班员一段，段间用 `;` 分隔，段内四个字段用 `:` 分隔；
+- 角色清单为 `submit`（可提交待审更正）、`review`（可批准/拒绝）中的一个
+  或两个，多个角色用 `,` 分隔；
+- 工号与 token 必须各自全局唯一；配置非法（字段数不对、角色非法、凭证
+  重复、登记本为空等）会让服务**启动即失败**，避免"以为有凭证"。
+
+请求通过 `Authorization: Bearer <token>` 头出示凭证（等价地也支持
+`X-Operator-Token: <token>`；两个头同时出现时必须一致，否则 401）。
+
+默认内置一份**仅用于本地/演示**的登记本，生产部署应整体替换：
+
+| 工号 | 姓名 | token | 角色 |
+| --- | --- | --- | --- |
+| `duty-alice` | Alice | `alice-token` | submit, review |
+| `duty-bob` | Bob | `bob-token` | submit, review |
+| `duty-carol` | Carol | `carol-token` | submit |
+| `reviewer-dave` | Dave | `dave-token` | review |
+
+用自定义登记本启动（例如去掉内置演示账号、只保留本站值班员）：
+
+```bash
+SOP_OPERATORS='duty-zhang:张值班:sec-7f3a91:submit,review;duty-li:李值班:sec-2bd10e:review' \
+  SOP_DB_PATH=./sop.db uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+Docker 部署可在 `docker-compose.yml` 的 `environment:` 中加一行
+`SOP_OPERATORS: "..."`，启动方式（`docker compose up --build`）不变。
 
 修改宿主机映射端口（例如改用 18080）：
 
@@ -852,6 +899,159 @@ curl -sS 'http://localhost:8080/api/v1/audit/events?cursor=0&limit=100'
 | 时刻缺时区/不可解析、编号为空串 | `422` | `invalid_time` / `invalid_number` |
 | `numbers` 为空/缺失、缺 `known_as_of`、出现额外字段 | `422` | `validation_error` |
 
+### 13. 待审更正提案（双人复核）
+
+值班员希望更正先经过**另一名值班员审核**再发布时使用。提交人凭本地凭证
+（第 2 节"值班员凭证配置"，`submit` 角色）提交，审核人凭**另一名**值班员
+凭证（`review` 角色）批准或拒绝；既有"直接更正"（第 2 节）、撤回、回溯
+与审计接口契约完全不变。
+
+凭证随每个请求以 `Authorization: Bearer <token>`（或 `X-Operator-Token`
+头）出示。下文示例用内置演示登记本：Alice/Bob 兼具两种角色，Carol 仅能
+提交，Dave 仅能审核。
+
+#### 13.1 提交待审更正 `POST /api/v1/correction-proposals`
+
+请求体与 `POST /api/v1/corrections` **完全一致**：单条对象，或
+`{"items": [...]}` 批量。服务只做与历史无关的**形状校验**（编号/正文非空、
+区间非空且可解析、前置编号无空白/重复），随后把内容**原样、不可变**地
+保存为提案；**不校验编号/基版是否存在、不占版本号、不写审计事件**
+（因此提案可以先于区间空闲而提交，最终合法性留到批准时按当时版本链判定）。
+
+```bash
+curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Authorization: Bearer alice-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-001",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "待审更正正文：3 月检修期还须穿戴防割手套。"
+      }'
+```
+
+成功 `201`，返回提案编号、状态 `pending`、提交人与条目（`prerequisites`
+保留提交形态：省略为 `null`、显式列表原样返回；pending 条目不含
+`published_revision`）：
+
+```json
+{
+  "id": "9d0bc0a8b61f42d2abbbe583d5c8c465",
+  "status": "pending",
+  "submitted_at": "2026-10-06T12:00:00.000000Z",
+  "submitter": {"operator_id": "duty-alice", "name": "Alice"},
+  "decided_at": null,
+  "reviewer": null,
+  "reason": null,
+  "count": 1,
+  "items": [
+    {"index": 0, "number": "SOP-001", "base_revision": 0,
+     "valid_start": "2026-03-01T00:00:00.000000Z",
+     "valid_end":   "2026-04-01T00:00:00.000000Z",
+     "body": "待审更正正文：……", "prerequisites": null}
+  ]
+}
+```
+
+提交即拒绝的情形（**没有任何提案落库**）：
+
+| 情况 | 状态码 | error.code |
+| --- | --- | --- |
+| 未出示凭证 / token 无法识别 / 两个凭证头不一致 | `401` | `invalid_credentials` |
+| 凭证有效但没有 `submit` 角色 | `403` | `forbidden` |
+| 编号/正文为空、区间空或不可解析、时刻缺时区 | `422` | `invalid_number` / `invalid_body` / `invalid_interval` / `invalid_time` |
+| 前置编号空白/重复、`items` 为空、额外字段 | `422` | `invalid_number` / `duplicate_prerequisite_number` / `validation_error` |
+
+#### 13.2 审核（批准/拒绝）`POST /api/v1/correction-proposals/{id}/decision`
+
+请求体 `{"decision": "approve" | "reject", "reason"?: "..."}`，须由
+**具 `review` 角色且与提交人不同**的另一名值班员调用；`reason` 可选、
+仅在拒绝时留档。处理时刻由服务端记录、不接受回填。
+
+```bash
+# 批准（Bob 是另一名审核值班员）
+curl -sS -X POST \
+  "$BASE_URL/api/v1/correction-proposals/9d0bc0a8b61f42d2abbbe583d5c8c465/decision" \
+  -H 'Authorization: Bearer bob-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'
+```
+
+**批准语义（关键）**：在**同一条 `BEGIN IMMEDIATE` 写事务**内，用与直接
+更正**逐行相同**的校验（第 2 节的 `_apply_corrections`）按**批准当时**的
+版本链重验**整批**——基版存在且未撤回、子区间落在基版当前剩余生效区间、
+同批对同一基版的子区间互不重叠、前置编号"省略继承/显式 `[]` 清空/显式
+替换"，且**同批按输入顺序应用、后项可引用前项拟生成版本**（与批量直接
+更正一致）。
+
+- 整批合法：发布版本（版本号在规程内继续递增）、与版本在**同一事务**写入
+  **原有审计批次**（一个批次，事件按条目顺序，`operation=correction`），
+  再把提案置为 `approved` 并回填各条目实际发布的版本号
+  `published_revision`。提案提交本身不产生审计事件。
+- 任一条非法：返回与直接更正**完全相同**的错误码/原因
+  （`not_found` / `base_version_not_found` / `invalid_interval` /
+  `base_version_withdrawn` / `expired_base_version`（带
+  `remaining_intervals`）/ `concurrent_correction_conflict` /
+  `invalid_body` / `invalid_number` /
+  `duplicate_prerequisite_number`），`error.details.index` 指明出错条目
+  （从 0 起）；事务整体回滚——**提案仍为 `pending`，不留下任何部分版本或
+  审计事件**，可在版本变化消除后重新批准，或直接拒绝。
+
+批准成功响应（`200`，形状与按编号查询一致）：
+
+```json
+{
+  "id": "9d0bc0a8b61f42d2abbbe583d5c8c465",
+  "status": "approved",
+  "submitted_at": "2026-10-06T12:00:00.000000Z",
+  "submitter": {"operator_id": "duty-alice", "name": "Alice"},
+  "decided_at": "2026-10-06T13:05:00.000000Z",
+  "reviewer": {"operator_id": "duty-bob", "name": "Bob"},
+  "reason": null,
+  "count": 1,
+  "items": [
+    {"index": 0, "number": "SOP-001", "base_revision": 0,
+     "valid_start": "2026-03-01T00:00:00.000000Z",
+     "valid_end":   "2026-04-01T00:00:00.000000Z",
+     "body": "待审更正正文：……", "prerequisites": null,
+     "published_revision": 1}
+  ]
+}
+```
+
+**拒绝**（`{"decision": "reject", "reason": "正文依据有误"}`）只把提案置
+为 `rejected`、记录处理人/处理时刻/原因，**不发布版本、不写审计事件**。
+
+审核拒绝情形（均**不改变提案状态**，除本次成功的状态转移外）：
+
+| 情况 | 状态码 | error.code |
+| --- | --- | --- |
+| 凭证缺失/无效 | `401` | `invalid_credentials` |
+| 没有 `review` 角色 | `403` | `forbidden` |
+| 审核人就是提交人 | `403` | `submitter_cannot_review` |
+| 提案编号不存在 | `404` | `proposal_not_found` |
+| 批准一个**已拒绝**提案 | `409` | `rejected_proposal_not_approvable（details 带原处理人/处理时刻） |
+| 重复处理已到终态（approved/rejected）的提案 | `409` | `proposal_already_decided`（details 带原状态/处理人/处理时刻） |
+| `decision` 非 approve/reject、出现额外字段 | `422` | `validation_error` |
+| 批准时整批任一非法（含期间被并发写入抢占） | 同直接更正 `404`/`409`/`422`，`details.index` 指条目位置；提案仍 pending |
+
+> **并发批准至多一次**：所有写操作经同一把进程内写锁串行，并在同一条
+> `BEGIN IMMEDIATE` 事务内完成；提案到终态的状态转移带
+> `WHERE status='pending'` 条件。两名审核人同时批准同一提案时，恰好一次
+> 成功、另一次得到 `409 proposal_already_decided`。同样，批准与直接更正/
+> 撤回之间也按确定的全局先后次序生效：若他人先占区间，批准事务按当时
+> 版本链重验失败、整体回滚（提案仍待审）。
+
+#### 13.3 按编号查询提案 `GET /api/v1/correction-proposals/{id}`
+
+须出示任一有效值班员凭证（不要求特定角色）。返回提案**完整内容**、状态、
+提交人（`submitter`）、处理人（`reviewer`，未处理为 `null`）、处理时刻
+（`decided_at`，未处理为 `null`）、拒绝原因（`reason`）与各条目；
+`approved` 提案的每条目带成功发布的版本号 `published_revision`，
+`pending`/`rejected` 时无该字段（不占版本号）。编号不存在 ->
+`404 proposal_not_found`；凭证无效 -> `401`。
+
 ---
 
 ## 四、调用示例
@@ -884,7 +1084,13 @@ curl -sS 'http://localhost:8080/api/v1/audit/events?cursor=0&limit=100'
 **跨规程版本覆盖检查（多编号按全体版本端点切分作业区间、逐段返回各编号
 有效版本/正文或缺口、撤回恢复与区间外空档与版本切换逐项标记、相邻段仅整组
 完全相同才合并、编号重复/不存在/未来知悉时刻/空区间拒绝且全程只读不写
-历史）**。
+历史）**→
+**待审更正提案（值班员凭本地凭证提交：不可变提案不占版本号、另一审核
+值班员批准/拒绝、提交人审核人分离、凭证无效/权限不足/重复处理拒绝且状态
+不变；批准在同一写事务内按当前版本链重验整批基版/区间/前置/同批顺序再发布
+并写原有审计批次，期间版本变化按现有原因与条目位置拒绝且提案仍待审、不留
+部分版本或审计事件；已拒绝不可批准、并发批准至多一次；按编号查询内容/状态/
+提交人/处理人/处理时刻/发布版本号）**。
 
 ---
 
@@ -940,6 +1146,20 @@ curl -sS 'http://localhost:8080/api/v1/audit/events?cursor=0&limit=100'
 - **原子拒绝**：写操作在单条 `BEGIN IMMEDIATE` 写事务内完成"校验 + 插入"，
   进程内写锁串行化；校验失败即回滚，绝不留下半截历史。撤回与并发更正由此
   按确定次序先后生效，同一区间不会并存两份当前正文。
+- **待审更正提案即"先存后核、批准即同事务重放"**：凭证在**本地登记**
+  （`SOP_OPERATORS`，`app/auth.py` 解析为 token→值班员的内存表，角色
+  `submit`/`review`；配置非法启动即失败），以 `Authorization: Bearer
+  <token>`（或 `X-Operator-Token` 头）出示。提案表
+  （`correction_proposals` + `correction_proposal_items`）只追加：提交时
+  原样留档全部更正字段（前置以 `inherit/explicit` + JSON 区分省略与显式
+  列表），只做形状校验、**不碰版本链、不占版本号、不写审计**。审核在同一
+  把写锁、同一条写事务内完成状态条件转移（`pending→approved/rejected`，
+  提交人≠审核人）：批准把留档条目还原为应用逻辑输入，**复用直接更正的
+  `_apply_corrections` 按批准当时版本链重验整批**——通过才发布版本并把这
+  一批写进**原有审计批次**（值班审计日志因此天然包含提案批准发布的更正），
+  任一非法则整事务回滚，提案保持 `pending`，无部分版本/审计；拒绝只记录
+  终态与原因。终态不可再处理（已拒绝不可批准），条件更新保证并发批准至多
+  成功一次；批准成功后各条目回填实际 `published_revision` 供按编号查询。
 - **值班审计即提交事务批次**：`audit_batches`（每个已提交写事务一行，
   自增 `seq` 即游标位点）与 `audit_events`（批次内按请求顺序、带操作类型/
   规程编号/版本号/服务端时刻）在业务写事务**同一事务**内追加；写事务回滚
@@ -967,7 +1187,7 @@ pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-共 182 个用例，覆盖双时间维可见性边界（含微秒）、时区偏移规范化、更正仅覆盖
+共 198 个用例，覆盖双时间维可见性边界（含微秒）、时区偏移规范化、更正仅覆盖
 子区间、链式更正、四类整体拒绝、批量原子回滚、两知悉时刻区间对比、**更正撤回
 （撤回后恢复父版本正文、撤回前知悉时刻历史不变、撤回时刻边界、首版/重复撤回/
 已有子更正/以撤回版本为基版等拒绝、撤回后再次更正、撤回与并发撤回的确定性
@@ -994,7 +1214,15 @@ python -m unittest discover -s tests -v
 （全体编号版本端点切分作业区间、逐段返回有效版本/正文或缺口、撤回恢复标记
 与恢复边界不合并、相邻整组完全相同才合并、版本切换逐项与片段级标记、区间
 端点裁剪、区间外版本与未发布更正不切分、空列表/重复/空编号/编号不存在/
-非法时间/未来知悉时刻拒绝、只读不写历史）**及完整 HTTP 流程。
+非法时间/未来知悉时刻拒绝、只读不写历史）**、**待审更正提案（不可变提案
+只做形状校验且不占版本号/不写审计、前置省略/显式原样留档、提交人=审核人
+拒绝、仅 submit/review 角色分别放行、批准在同一写事务按当前版本链重验整批
+并发布与写原有审计批次、同批按序应用后项引用前项与省略继承/显式清空、期间
+被直接更正抢占返回 expired_base_version/base_version_withdrawn 且
+details.index 指位置、提案仍 pending 且无部分版本/审计、拒绝不发布、已拒绝
+不可批准与终态重复处理 409 状态不变、并发批准至多一次、按编号查询回填
+published_revision、凭证登记本解析与重复/非法角色拒绝、完整 HTTP 鉴权
+流程）**及完整 HTTP 流程。
 
 > 本机未安装 fastapi/httpx 时，HTTP 用例自动跳过（服务层用例不受影响）；
 > Docker 镜像与 CI 安装 `requirements-dev.txt` 后全部运行。
@@ -1009,14 +1237,17 @@ python -m unittest discover -s tests -v
 │   │                    #   撤回 / 回溯 / 对比 / 规程包 /
 │   │                    #   前置规程递归解析（单时刻闭包 / 跨时段逐片段可用性）/
 │   │                    #   值班审计变动日志（游标增量、批次原子分页）/
-│   │                    #   跨规程版本覆盖检查（逐段整组状态）
+│   │                    #   跨规程版本覆盖检查（逐段整组状态）/
+│   │                    #   待审更正提案（不可变提案、批准时同事务重验整批）
+│   ├── auth.py          # 本地值班员凭证登记本（SOP_OPERATORS）、Bearer 鉴权与角色
 │   ├── db.py            # SQLite 连接、建表（含 withdrawals、packages、
-│   │                    #   prerequisites、audit_batches/audit_events 等）、
+│   │                    #   prerequisites、audit_batches/audit_events、
+│   │                    #   correction_proposals/_items 等）、
 │   │                    #   升级前历史的审计回填、写事务与只读快照事务
 │   ├── schemas.py       # 请求模型（额外字段一律拒绝）
 │   ├── errors.py        # 领域错误（稳定 code）
 │   ├── time_utils.py    # UTC 时间解析与规范化
-│   └── config.py        # 环境变量配置
+│   └── config.py        # 环境变量配置（含 SOP_OPERATORS 凭证登记本）
 ├── examples/
 │   ├── python_client.py # 标准库 Python 调用示例
 │   └── curl-examples.sh # curl 调用示例

@@ -108,6 +108,46 @@ CREATE TABLE IF NOT EXISTS audit_events (
     UNIQUE(batch_seq, position)
 );
 
+-- 待审更正提案：值班员凭本地凭证提交、另一名有审核权限的值班员批准/拒绝。
+-- 提案本身**只追加、不可变**：提交时把沿用"现有单条/批量更正字段"的请求
+-- 内容原样落库（proposal_items 按请求顺序），不校验版本链、不占版本号；
+-- 批准时在同一条写事务内按当时版本链重验整批（_apply_corrections），
+-- 通过才发布版本并写入原有审计批次；期间版本变化导致任一条非法时整批
+-- 失败，提案仍停在 pending，不留下任何版本或审计事件。
+-- status 生命周期：pending -> approved | rejected（终态不可再处理）；
+-- 并发批准至多成功一次（状态转移在 BEGIN IMMEDIATE 事务内条件更新）。
+CREATE TABLE IF NOT EXISTS correction_proposals (
+    id            TEXT PRIMARY KEY,
+    status        TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+    submitter_id   TEXT NOT NULL,
+    submitter_name TEXT NOT NULL,
+    submitted_at  TEXT NOT NULL,
+    item_count    INTEGER NOT NULL,
+    decided_by    TEXT,
+    decided_by_name TEXT,
+    decided_at    TEXT,
+    decision_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS correction_proposal_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id     TEXT NOT NULL REFERENCES correction_proposals(id),
+    position        INTEGER NOT NULL,
+    number          TEXT NOT NULL,
+    base_revision   INTEGER NOT NULL,
+    body            TEXT NOT NULL,
+    valid_start     TEXT NOT NULL,
+    valid_end       TEXT NOT NULL,
+    -- 前置编号以 JSON 留档：NULL = 请求省略（批准时继承基版）；
+    -- "[]" = 显式清空；其余为显式替换列表（原样留档，不做存在性校验）。
+    prereq_mode     TEXT NOT NULL CHECK (prereq_mode IN ('inherit','explicit')),
+    prereq_json     TEXT,
+    -- 批准成功后该条目实际发布的版本号（仅 approved 时非空），与审计批次
+    -- 事件一一对应；pending/rejected 恒为 NULL（提案不占版本号）。
+    published_revision INTEGER,
+    UNIQUE(proposal_id, position)
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_procedure
     ON versions(procedure_id);
 CREATE INDEX IF NOT EXISTS idx_versions_query
@@ -120,6 +160,8 @@ CREATE INDEX IF NOT EXISTS idx_prerequisites_version
     ON prerequisites(version_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_batch
     ON audit_events(batch_seq, position);
+CREATE INDEX IF NOT EXISTS idx_proposal_items_proposal
+    ON correction_proposal_items(proposal_id, position);
 """
 
 _write_lock = threading.Lock()

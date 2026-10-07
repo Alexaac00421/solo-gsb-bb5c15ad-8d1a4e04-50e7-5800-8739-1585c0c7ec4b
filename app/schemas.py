@@ -44,6 +44,16 @@ class CorrectionBatch(StrictModel):
     items: list[CorrectionItem]
 
 
+class ProposalDecisionRequest(StrictModel):
+    """待审更正提案的审核决定：批准或拒绝。
+
+    ``decision`` 必填；``reason`` 仅在拒绝时可选填写（批准时忽略）。
+    不接受处理人/处理时刻等字段——身份由凭证头识别、时刻由服务端记录。
+    """
+    decision: str = Field(..., description="审核决定：approve（批准）或 reject（拒绝）")
+    reason: str | None = Field(default=None, description="拒绝原因（可选，仅 reject 时有意义）")
+
+
 class CorrectionPreviewItem(CorrectionItem):
     """单条预演：字段与更正条目完全一致，另须指定非空作业区间。"""
     work_start: str = Field(..., description="预演作业区间起点（含），ISO-8601 带时区")

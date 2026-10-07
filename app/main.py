@@ -6,14 +6,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import service
+from . import auth, service
 from .config import settings
 from .db import init_db
 from .errors import DomainError
 from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
                       CorrectionPreviewItem, CoverageCheckRequest,
-                      PackageRequest, ReleaseBatch, ReleaseItem,
-                      WithdrawalBatch, WithdrawalItem)
+                      PackageRequest, ProposalDecisionRequest, ReleaseBatch,
+                      ReleaseItem, WithdrawalBatch, WithdrawalItem)
 
 app = FastAPI(
     title="安全作业规程历史回溯服务",
@@ -22,13 +22,18 @@ app = FastAPI(
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
                  "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）、"
-                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号），"
-                 "以及调度员安排跨规程作业前的版本覆盖检查（逐段整组状态）。"),
+                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号）、"
+                 "值班员凭本地凭证提交的待审更正提案（另一名审核值班员批准/"
+                 "拒绝，批准在同一写事务内按当前版本链重验整批并写入原有审计"
+                 "批次），以及调度员安排跨规程作业前的版本覆盖检查"
+                 "（逐段整组状态）。"),
 )
 
 
 @app.on_event("startup")
 def _startup() -> None:
+    # 启动即解析本地值班员凭证登记本（配置非法会在此立即失败），并幂等建表。
+    auth.load_operators()
     init_db()
 
 
@@ -67,6 +72,9 @@ def index() -> dict:
                 "POST /api/v1/releases",
                 "POST /api/v1/corrections",
                 "POST /api/v1/corrections/preview",
+                "POST /api/v1/correction-proposals",
+                "POST /api/v1/correction-proposals/{proposal_id}/decision",
+                "GET  /api/v1/correction-proposals/{proposal_id}",
                 "POST /api/v1/withdrawals",
                 "GET  /api/v1/effective",
                 "GET  /api/v1/procedures/{number}/history",
@@ -135,6 +143,59 @@ def _coerce_preview(payload: dict) -> tuple[list, str, str]:
         return [single], single.work_start, single.work_end
     except ValidationError as exc:
         raise RequestValidationError(exc.errors())
+
+
+@app.post("/api/v1/correction-proposals", status_code=201)
+async def submit_correction_proposal(request: Request) -> dict:
+    """值班员提交待审更正提案：需 ``submit`` 角色（本地凭证）。
+
+    请求体与 ``/api/v1/corrections`` 完全一致（单条对象或
+    ``{"items": [...]}`` 批量）。服务把提案原样保存为不可变提案并返回
+    编号、状态（pending）与条目；只做条目形状校验，不校验版本链、不占
+    版本号、不写审计事件。凭证缺失/无效 -> 401；无 submit 角色 -> 403。
+    """
+    operator = auth.require_operator(request, "submit")
+    payload = await request.json()
+    items = _coerce_items(payload, CorrectionItem, CorrectionBatch)
+    return service.submit_correction_proposal(items, operator)
+
+
+@app.post("/api/v1/correction-proposals/{proposal_id}/decision",
+          status_code=200)
+async def decide_correction_proposal(proposal_id: str,
+                                     request: Request) -> dict:
+    """另一名具 ``review`` 角色的值班员批准/拒绝待审更正提案。
+
+    请求体 ``{"decision": "approve" | "reject", "reason"?: "..."}``。
+    提交人与审核人不得相同（403）；终态提案重复处理、批准已拒绝提案 ->
+    409 且状态不变。批准在同一写事务内按当前版本链重验整批，期间版本
+    变化导致任一条非法时返回现有冲突原因与 ``details.index``，提案仍
+    pending，不留部分版本或审计事件；并发批准至多成功一次。
+    """
+    reviewer = auth.require_operator(request, "review")
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise RequestValidationError([
+            {"type": "model_type", "loc": ["body"],
+             "msg": "请求体必须是 JSON 对象，含 decision 字段"}])
+    try:
+        body = ProposalDecisionRequest(**(payload or {}))
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors())
+    return service.decide_correction_proposal(
+        proposal_id, body.decision, body.reason, reviewer)
+
+
+@app.get("/api/v1/correction-proposals/{proposal_id}")
+def get_correction_proposal(proposal_id: str, request: Request) -> dict:
+    """按编号查询待审更正提案：需任一有效值班员身份（凭凭证头识别）。
+
+    返回提案内容、状态、提交人、处理人、处理时刻，以及批准成功后各条目
+    实际发布的版本号（pending/rejected 时为 null）。不存在 -> 404
+    proposal_not_found。
+    """
+    auth.authenticate(request)
+    return service.get_correction_proposal(proposal_id)
 
 
 @app.post("/api/v1/withdrawals", status_code=201)

@@ -754,3 +754,143 @@ curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
         \"work_end\":   \"2026-03-01T00:00:00Z\",
         \"known_as_of\": \"$KNOWN2\"
       }"; echo
+
+# ===========================================================================
+# 13. 待审更正提案（双人复核）
+# 凭证为本机登记本（默认演示）：alice/bob=submit+review，carol=submit，
+# dave=review。生产用 SOP_OPERATORS 替换（见 README 第 2 节）。
+# ===========================================================================
+
+# --- 46.0 准备：发布一个供提案更正的规程 --------------------------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-001",
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+
+# --- 46.1 未出示凭证 -> 401 invalid_credentials --------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-001", "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "没有凭证，应被拒绝"
+      }'; echo
+
+# --- 46.2 Alice（submit+review）提交待审更正 -> 201 pending --------------
+# 响应存到临时文件并取出 id，供后续步骤直接引用（脚本可整条运行）。
+curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Authorization: Bearer alice-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-001", "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "待审更正：3 月检修期还须穿戴防割手套。"
+      }' > /tmp/sop-prop-1.json
+cat /tmp/sop-prop-1.json; echo
+PID=$(python3 -c 'import json;print(json.load(open("/tmp/sop-prop-1.json"))["id"])')
+# 批量形式同样支持 {"items": [ {…}, {…} ]}（同批按顺序应用、后项可引用
+# 前项拟生成版本）。等价凭证头 X-Operator-Token 也可（与 Authorization
+# 同时出现时必须一致）：-H 'X-Operator-Token: alice-token'
+echo ">> 提案编号 PID=$PID"
+
+# --- 46.3 提交人自审 -> 403 submitter_cannot_review ----------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PID/decision" \
+  -H 'Authorization: Bearer alice-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'; echo
+
+# --- 46.4 carol 仅有 submit 角色，审核 -> 403 forbidden ------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PID/decision" \
+  -H 'Authorization: Bearer carol-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'; echo
+
+# --- 46.5 另一名审核值班员 Bob 批准 -> approved，published_revision=1 ----
+# 批准在同一写事务内按当前版本链重验整批，再发布版本并写入原有审计批次。
+curl -sS -X POST "$BASE_URL/api/v1/correction-proposals/$PID/decision" \
+  -H 'Authorization: Bearer bob-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'; echo
+
+# --- 46.6 重复处理已终态提案 -> 409 proposal_already_decided -------------
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PID/decision" \
+  -H 'Authorization: Bearer dave-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'; echo
+
+# --- 46.7 按编号查询：内容/状态/提交人/处理人/处理时刻/发布版本号 --------
+curl -sS "$BASE_URL/api/v1/correction-proposals/$PID" \
+  -H 'Authorization: Bearer alice-token'; echo
+
+# --- 46.8 拒绝流程：Carol 提交、Dave 拒绝；已拒绝不可再批准 --------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-002",
+        "body": "初版正文。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }' >/dev/null
+PID2=$(curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Authorization: Bearer carol-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-002", "base_revision": 0,
+        "valid_start": "2026-05-01T00:00:00Z",
+        "valid_end":   "2026-06-01T00:00:00Z",
+        "body": "依据不足的待审更正。"
+      }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+curl -sS -X POST "$BASE_URL/api/v1/correction-proposals/$PID2/decision" \
+  -H 'Authorization: Bearer dave-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "reject", "reason": "正文依据有误，退回"}'; echo
+
+# 已拒绝提案不可批准 -> 409 rejected_proposal_not_approvable
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PID2/decision" \
+  -H 'Authorization: Bearer bob-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'; echo
+
+# --- 46.9 审批期间版本变化：被直接更正抢占 -> 409，提案仍 pending --------
+# 先提交一个 8 月区间的提案（Alice），在批准前用直接更正抢走同一区间；
+# 批准时按当前版本链重验失败，返回现有原因 expired_base_version 与
+# details.index；提案仍待审，不留下部分版本或审计事件。
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-003",
+        "body": "初版正文。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }' >/dev/null
+PID3=$(curl -sS -X POST "$BASE_URL/api/v1/correction-proposals" \
+  -H 'Authorization: Bearer alice-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-003", "base_revision": 0,
+        "valid_start": "2026-08-01T00:00:00Z",
+        "valid_end":   "2026-09-01T00:00:00Z",
+        "body": "待审的 8 月更正。"
+      }' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PROP-003", "base_revision": 0,
+        "valid_start": "2026-08-01T00:00:00Z",
+        "valid_end":   "2026-09-01T00:00:00Z",
+        "body": "审批期间被直接更正抢先发布。"
+      }' >/dev/null
+curl -sS -i -X POST "$BASE_URL/api/v1/correction-proposals/$PID3/decision" \
+  -H 'Authorization: Bearer bob-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"decision": "approve"}'; echo
+# 查询确认仍为 pending（可在抢占消除后重新批准，或拒绝）
+curl -sS "$BASE_URL/api/v1/correction-proposals/$PID3" \
+  -H 'Authorization: Bearer alice-token'; echo

@@ -14,11 +14,15 @@ import urllib.request
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 
 
-def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+def call(method: str, path: str, body: dict | None = None,
+         token: str | None = None) -> tuple[int, dict]:
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        # 值班员本地凭证：内置演示登记本（见 README 第 2 节"凭证配置"）
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
-        BASE_URL + path, data=data, method=method,
-        headers={"Content-Type": "application/json"})
+        BASE_URL + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, json.loads(resp.read())
@@ -136,6 +140,121 @@ def main() -> None:
 
     # 16) 跨规程版本覆盖检查（本轮新增）：调度员安排跨规程作业前核对版本覆盖
     _coverage_examples()
+
+    # 17) 待审更正提案（双人复核）：本地凭证 + 另一审核值班员批准/拒绝
+    _correction_proposal_examples()
+
+
+def _correction_proposal_examples() -> None:
+    """待审更正提案：凭证提交 -> 另一审核值班员批准/拒绝，批准按当前版本链
+    在同一写事务内重验整批并发布、写入原有审计批次。
+
+    使用内置演示登记本（见 README 第 2 节）：
+    Alice/Bob=submit+review，Carol=仅 submit，Dave=仅 review。
+    """
+    number = "SOP-DEMO-PROP-1"
+    call("POST", "/api/v1/releases", {
+        "number": number,
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+
+    # 17.1) 不带凭证 -> 401 invalid_credentials
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "number": number, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "没有凭证，应被拒绝"})
+    show("17.1 未出示凭证 -> 401 invalid_credentials", status, res)
+
+    # 17.2) Alice（submit 角色）提交待审更正 -> 201 pending（不占版本号）
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "number": number, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "待审更正：3 月检修期还须穿戴防割手套。"}, token="alice-token")
+    show("17.2 Alice 提交待审更正 -> 201 pending", status, res)
+    proposal_id = res["id"]
+
+    # 17.3) 提交人自己不能审核 -> 403；Carol（仅 submit）也不能审核
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{proposal_id}/decision",
+                       {"decision": "approve"}, token="alice-token")
+    show("17.3a 提交人自审 -> 403 submitter_cannot_review", status, res)
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{proposal_id}/decision",
+                       {"decision": "approve"}, token="carol-token")
+    show("17.3b 无 review 角色 -> 403 forbidden", status, res)
+
+    # 17.4) 另一名审核值班员 Bob 批准 -> 发布 r1 并写入原有审计批次
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{proposal_id}/decision",
+                       {"decision": "approve"}, token="bob-token")
+    show("17.4 Bob 批准 -> approved，条目 published_revision=1", status, res)
+    # 重复处理 -> 409 proposal_already_decided，状态不变
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{proposal_id}/decision",
+                       {"decision": "approve"}, token="dave-token")
+    show("17.5 重复处理已批准提案 -> 409", status, res)
+    # 按编号查询：内容/状态/提交人/处理人/处理时刻/发布版本号
+    status, res = call("GET",
+                       f"/api/v1/correction-proposals/{proposal_id}",
+                       token="alice-token")
+    show("17.6 按编号查询已批准提案", status, res)
+
+    # 17.7) 拒绝流程：Carol 提交、Dave 拒绝；已拒绝不可再批准
+    number2 = "SOP-DEMO-PROP-2"
+    call("POST", "/api/v1/releases", {
+        "number": number2,
+        "body": "初版正文。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z"})
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "number": number2, "base_revision": 0,
+        "valid_start": "2026-05-01T00:00:00Z",
+        "valid_end": "2026-06-01T00:00:00Z",
+        "body": "依据不足的待审更正。"}, token="carol-token")
+    pid2 = res["id"]
+    show("17.7a Carol 提交第二个提案", status, res)
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{pid2}/decision",
+                       {"decision": "reject", "reason": "正文依据有误，退回"},
+                       token="dave-token")
+    show("17.7b Dave 拒绝 -> rejected（不发布版本、不写审计）", status, res)
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{pid2}/decision",
+                       {"decision": "approve"}, token="bob-token")
+    show("17.7c 已拒绝提案不可批准 -> 409", status, res)
+
+    # 17.8) 批准时按"当前版本链"重验：提案提交后区间被直接更正抢占，
+    #       批准失败（现有错误码 + details.index），提案仍 pending、无部分发布
+    number3 = "SOP-DEMO-PROP-3"
+    call("POST", "/api/v1/releases", {
+        "number": number3,
+        "body": "初版正文。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z"})
+    status, res = call("POST", "/api/v1/correction-proposals", {
+        "number": number3, "base_revision": 0,
+        "valid_start": "2026-08-01T00:00:00Z",
+        "valid_end": "2026-09-01T00:00:00Z",
+        "body": "待审的 8 月更正。"}, token="alice-token")
+    pid3 = res["id"]
+    call("POST", "/api/v1/corrections", {
+        "number": number3, "base_revision": 0,
+        "valid_start": "2026-08-01T00:00:00Z",
+        "valid_end": "2026-09-01T00:00:00Z",
+        "body": "审批期间被直接更正抢先发布。"})
+    status, res = call("POST",
+                       f"/api/v1/correction-proposals/{pid3}/decision",
+                       {"decision": "approve"}, token="bob-token")
+    show("17.8 批准时区间已被抢占 -> 409 expired_base_version（提案仍待审）",
+         status, res)
+    status, res = call("GET",
+                       f"/api/v1/correction-proposals/{pid3}",
+                       token="alice-token")
+    show("17.9 冲突后按编号查询：状态仍为 pending、无发布版本号", status, res)
 
 
 def _coverage_examples() -> None:

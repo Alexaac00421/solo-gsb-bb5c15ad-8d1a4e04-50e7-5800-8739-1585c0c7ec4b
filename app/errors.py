@@ -284,3 +284,47 @@ def page_limit_too_small(limit: int, batch_seq: int, batch_size: int) -> DomainE
         http_status=422,
         details={"limit": limit, "batch_seq": batch_seq,
                  "batch_size": batch_size})
+
+
+# ------------------------------------------------------------ 待审更正提案
+
+
+def proposal_not_found(proposal_id: str) -> DomainError:
+    return DomainError(
+        "proposal_not_found", f"待审更正提案 {proposal_id} 不存在",
+        http_status=404, details={"proposal_id": proposal_id})
+
+
+def proposal_already_decided(proposal_id: str, status: str,
+                             decided_by: str | None, decided_at: str | None) -> DomainError:
+    """重复处理（批准/拒绝）一个已到终态的提案：拒绝且状态不变。"""
+    verb = "批准" if status == "approved" else "拒绝"
+    return DomainError(
+        "proposal_already_decided",
+        f"提案 {proposal_id} 已{verb}（处理人 {decided_by}，处理时刻 {decided_at}），"
+        f"终态提案不得重复处理、状态不变",
+        http_status=409,
+        details={"proposal_id": proposal_id, "status": status,
+                 "decided_by": decided_by, "decided_at": decided_at})
+
+
+def rejected_proposal_not_approvable(proposal_id: str,
+                                     decided_by: str | None,
+                                     decided_at: str | None) -> DomainError:
+    """已拒绝提案不可再批准（与"重复处理"区分，明确拒绝原因）。"""
+    return DomainError(
+        "rejected_proposal_not_approvable",
+        f"提案 {proposal_id} 已被拒绝（处理人 {decided_by}，处理时刻 {decided_at}），"
+        f"拒绝为终态、不可再批准；如需更正请重新提交提案",
+        http_status=409,
+        details={"proposal_id": proposal_id, "status": "rejected",
+                 "decided_by": decided_by, "decided_at": decided_at})
+
+
+def submitter_cannot_review(operator_id: str) -> DomainError:
+    """提交人与审核人不得相同。"""
+    return DomainError(
+        "submitter_cannot_review",
+        f"值班员 {operator_id} 是该提案的提交人，提交人与审核人不得相同，"
+        f"必须由另一名具审核权限的值班员处理",
+        http_status=403, details={"operator_id": operator_id})

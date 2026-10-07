@@ -38,6 +38,8 @@ def reset_db() -> None:
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
             "DELETE FROM audit_events; DELETE FROM audit_batches; "
+            "DELETE FROM correction_proposal_items; "
+            "DELETE FROM correction_proposals; "
             "DELETE FROM prerequisites; "
             "DELETE FROM package_items; DELETE FROM packages; "
             "DELETE FROM withdrawals; "
@@ -2947,6 +2949,224 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(r.status_code, 422, bad)
             self.assertEqual(r.json()["error"]["code"], "invalid_page_limit")
 
+    # ---------------------------------------------------------- 待审更正提案
+
+    def test_correction_proposal_full_flow_http(self):
+        c = self.client
+        n = self._n()
+        HA = {"Authorization": "Bearer alice-token"}
+        HB = {"Authorization": "Bearer bob-token"}
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+
+        # 凭证缺失/无效 -> 401
+        r = c.post("/api/v1/correction-proposals", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "提案"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["error"]["code"], "invalid_credentials")
+        r = c.post("/api/v1/correction-proposals",
+                   headers={"Authorization": "Bearer nope"},
+                   json={"number": n, "base_revision": 0,
+                         "valid_start": t2, "valid_end": t3, "body": "提案"})
+        self.assertEqual(r.status_code, 401)
+        # X-Operator-Token 等价凭证头
+        r = c.post("/api/v1/correction-proposals",
+                   headers={"X-Operator-Token": "alice-token"},
+                   json={"number": n, "base_revision": 0,
+                         "valid_start": t2, "valid_end": t3, "body": "提案"})
+        self.assertEqual(r.status_code, 201, r.text)
+        pid = r.json()["id"]
+        self.assertEqual(r.json()["status"], "pending")
+        self.assertEqual(r.json()["submitter"]["operator_id"], "duty-alice")
+        self.assertIsNone(r.json()["reviewer"])
+        self.assertIsNone(r.json()["decided_at"])
+        # pending 条目不带已发布版本号
+        self.assertNotIn("published_revision", r.json()["items"][0])
+
+        # 仅 review 角色（dave）不能提交 -> 403
+        r = c.post("/api/v1/correction-proposals",
+                   headers={"Authorization": "Bearer dave-token"},
+                   json={"number": n, "base_revision": 0,
+                         "valid_start": t3, "valid_end": t4, "body": "x"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "forbidden")
+
+        # 提交人自己不能审核 -> 403
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers=HA, json={"decision": "approve"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["error"]["code"], "submitter_cannot_review")
+
+        # 只有 submit 角色（carol）不能审核 -> 403
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers={"Authorization": "Bearer carol-token"},
+                   json={"decision": "approve"})
+        self.assertEqual(r.status_code, 403)
+
+        # 另一审核值班员批准 -> 发布版本，条目回填发布版本号
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers=HB, json={"decision": "approve"})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["status"], "approved")
+        self.assertEqual(body["reviewer"]["operator_id"], "duty-bob")
+        self.assertIsNotNone(body["decided_at"])
+        self.assertEqual(body["items"][0]["published_revision"], 1)
+
+        # 3 月生效的是提案正文
+        found = [i for i in c.get("/api/v1/effective",
+                                  params={"work_time": t2}).json()["items"]
+                 if i["number"] == n][0]
+        self.assertEqual(found["body"], "提案")
+        self.assertEqual(found["revision"], 1)
+
+        # 重复处理 -> 409 且状态不变
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers={"Authorization": "Bearer dave-token"},
+                   json={"decision": "approve"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"],
+                         "proposal_already_decided")
+
+        # 按编号查询仍返回完整内容
+        r = c.get(f"/api/v1/correction-proposals/{pid}", headers=HB)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "approved")
+        # 编号不存在 -> 404
+        self.assertEqual(c.get("/api/v1/correction-proposals/nope",
+                               headers=HB).status_code, 404)
+        # 查询也要凭证
+        self.assertEqual(c.get(
+            f"/api/v1/correction-proposals/{pid}").status_code, 401)
+
+    def test_correction_proposal_reject_terminal_http(self):
+        c = self.client
+        n = self._n()
+        HC = {"Authorization": "Bearer carol-token"}
+        HD = {"Authorization": "Bearer dave-token"}
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        r = c.post("/api/v1/correction-proposals", headers=HC, json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "待拒"})
+        pid = r.json()["id"]
+
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers=HD, json={"decision": "reject",
+                                     "reason": "正文有误"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "rejected")
+        self.assertEqual(r.json()["reason"], "正文有误")
+        self.assertEqual(r.json()["reviewer"]["operator_id"], "reviewer-dave")
+
+        # 已拒绝不可批准 -> 专门错误码
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers={"Authorization": "Bearer alice-token"},
+                   json={"decision": "approve"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"],
+                         "rejected_proposal_not_approvable")
+        # 重复拒绝 -> 409
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers={"Authorization": "Bearer bob-token"},
+                   json={"decision": "reject"})
+        self.assertEqual(r.status_code, 409)
+        # 拒绝不发布版本、不产生审计事件
+        hist = c.get(f"/api/v1/procedures/{n}/history").json()
+        self.assertEqual([v["revision"] for v in hist["items"]], [0])
+        ops = [e["operation"] for e in c.get(
+            "/api/v1/audit/events", params={"limit": 1000}).json()["events"]]
+        self.assertEqual(ops, ["release"])
+        # 非法 decision -> 422
+        r = c.post(f"/api/v1/correction-proposals/{pid}/decision",
+                   headers=HD, json={"decision": "maybe"})
+        self.assertEqual(r.status_code, 422)
+
+    def test_correction_proposal_submit_validation_http(self):
+        c = self.client
+        n = self._n()
+        HA = {"Authorization": "Bearer alice-token"}
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        # 空区间 -> 422（形状校验在提交时）
+        r = c.post("/api/v1/correction-proposals", headers=HA, json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t2, "body": "x"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+        # 空正文 -> 422 invalid_body
+        r = c.post("/api/v1/correction-proposals", headers=HA, json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "   "})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_body")
+        # 编号不存在/基版不存在在提交时**不**校验（留待批准）
+        r = c.post("/api/v1/correction-proposals", headers=HA, json={
+            "number": "NO-SUCH", "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "未来再说"})
+        self.assertEqual(r.status_code, 201, r.text)
+        # 空 items -> 422
+        r = c.post("/api/v1/correction-proposals", headers=HA,
+                   json={"items": []})
+        self.assertEqual(r.status_code, 422)
+
+    def test_correction_proposal_conflicting_auth_headers_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "初版", "valid_start": t1, "valid_end": t5})
+        body = {"number": n, "base_revision": 0,
+                "valid_start": t2, "valid_end": t3, "body": "x"}
+        # 两个凭证头同时出现但不一致 -> 401
+        r = c.post("/api/v1/correction-proposals", headers={
+            "Authorization": "Bearer alice-token",
+            "X-Operator-Token": "bob-token"}, json=body)
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["error"]["code"], "invalid_credentials")
+        # 两个凭证头一致 -> 放行
+        r = c.post("/api/v1/correction-proposals", headers={
+            "Authorization": "Bearer alice-token",
+            "X-Operator-Token": "alice-token"}, json=body)
+        self.assertEqual(r.status_code, 201)
+        # 非 Bearer 方案 -> 401
+        r = c.post("/api/v1/correction-proposals", headers={
+            "Authorization": "Basic alice-token"}, json=body)
+        self.assertEqual(r.status_code, 401)
+
+
+class AuthConfigTests(unittest.TestCase):
+    """本地凭证登记本解析。"""
+
+    def test_parse_default_registry(self):
+        from app import auth
+        from app.config import DEFAULT_OPERATORS
+        ops = auth.parse_operators(DEFAULT_OPERATORS)
+        by_id = {o.operator_id: o for o in ops}
+        self.assertEqual(set(by_id),
+                         {"duty-alice", "duty-bob", "duty-carol",
+                          "reviewer-dave"})
+        self.assertTrue(by_id["duty-alice"].can_submit())
+        self.assertTrue(by_id["duty-alice"].can_review())
+        self.assertTrue(by_id["duty-carol"].can_submit())
+        self.assertFalse(by_id["duty-carol"].can_review())
+        self.assertFalse(by_id["reviewer-dave"].can_submit())
+        self.assertTrue(by_id["reviewer-dave"].can_review())
+
+    def test_parse_rejects_bad_registry(self):
+        from app import auth
+        bad_entries = [
+            "only-three:a:b",                          # 字段数不对
+            "u:name:tok:superuser",                    # 非法角色
+            "u:name:tok:",                             # 无角色
+            "u:name:tok:submit;u2:n2:tok:submit",      # token 重复
+            "u:name:tok:submit;u:n2:tok2:submit",      # 工号重复
+            "",                                        # 空登记本
+        ]
+        for raw in bad_entries:
+            with self.assertRaises(auth.OperatorConfigError):
+                auth.parse_operators(raw)
+
 
 class AuditFeedTests(unittest.TestCase):
     """值班审计变动日志：按提交顺序增量取回，批次原子分页。"""
@@ -3252,6 +3472,252 @@ class AuditBackfillTests(unittest.TestCase):
                 [("release", "UPG-1", 0)])
         finally:
             object.__setattr__(settings, "db_path", old_path)
+
+
+class CorrectionProposalTests(unittest.TestCase):
+    """待审更正提案（服务层）：保存不可变、双人审核、批准时按当前版本链
+    重验整批、原子发布并写原审计批次、终态与并发约束。"""
+
+    def setUp(self):
+        reset_db()
+        from app import auth
+        self.auth = auth
+        self.alice = auth.by_token("alice-token")
+        self.bob = auth.by_token("bob-token")
+        self.carol = auth.by_token("carol-token")
+        self.dave = auth.by_token("dave-token")
+
+    def _pitem(self, number, base, start, end, body="提案更正",
+               prerequisites=None):
+        return item(number, body, start, end, base=base,
+                    prerequisites=prerequisites)
+
+    def _submit(self, items, operator=None):
+        return service.submit_correction_proposal(
+            items, operator or self.alice)
+
+    def test_submit_does_not_consume_revision_or_audit(self):
+        release("PR-1")
+        p = self._submit([self._pitem("PR-1", 0, t2, t3)])
+        self.assertEqual(p["status"], "pending")
+        self.assertEqual(p["count"], 1)
+        self.assertIsNone(p["items"][0].get("published_revision"))
+        # 不占版本号：历史仍只有 r0
+        self.assertEqual(
+            [v["revision"] for v in service.list_history("PR-1")["items"]],
+            [0])
+        # 不写审计事件
+        self.assertEqual(
+            [e["operation"] for e in service.read_change_feed(None, 1000)["events"]],
+            ["release"])
+        # 提案不可变：再查内容一致
+        g = service.get_correction_proposal(p["id"])
+        self.assertEqual(g["items"][0]["number"], "PR-1")
+        self.assertEqual(g["items"][0]["prerequisites"], None)
+        self.assertIsNone(g["reviewer"])
+        self.assertIsNone(g["decided_at"])
+
+    def test_submit_shape_validation(self):
+        release("PR-2")
+        # 空区间 / 空正文 / 空编号在提交时即拒（状态无从产生）
+        with self.assertRaises(DomainError) as ctx:
+            self._submit([self._pitem("PR-2", 0, t2, t2)])
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+        with self.assertRaises(DomainError) as ctx:
+            self._submit([item("PR-2", "  ", t2, t3, base=0)])
+        self.assertEqual(ctx.exception.code, "invalid_body")
+        with self.assertRaises(DomainError) as ctx:
+            self._submit([item("  ", "b", t2, t3, base=0)])
+        self.assertEqual(ctx.exception.code, "invalid_number")
+        # 前置编号重复在提交时即拒
+        with self.assertRaises(DomainError) as ctx:
+            self._submit([self._pitem("PR-2", 0, t2, t3,
+                                      prerequisites=["X", "X"])])
+        self.assertEqual(ctx.exception.code,
+                         "duplicate_prerequisite_number")
+        # 编号/基版不存在不在提交时校验
+        p = self._submit([self._pitem("NO-SUCH-PROC", 0, t2, t3)])
+        self.assertEqual(p["status"], "pending")
+
+    def test_approve_rejects_same_submitter(self):
+        release("PR-3")
+        p = self._submit([self._pitem("PR-3", 0, t2, t3)], self.alice)
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                p["id"], "approve", None, self.alice)
+        self.assertEqual(ctx.exception.code, "submitter_cannot_review")
+        self.assertEqual(ctx.exception.http_status, 403)
+        # 状态不变
+        self.assertEqual(service.get_correction_proposal(p["id"])["status"],
+                         "pending")
+
+    def test_approve_happy_path_publishes_and_audits(self):
+        release("PR-4")
+        p = self._submit([self._pitem("PR-4", 0, t2, t3, body="三月版")],
+                         self.alice)
+        out = service.decide_correction_proposal(
+            p["id"], "approve", None, self.bob)
+        self.assertEqual(out["status"], "approved")
+        self.assertEqual(out["reviewer"]["operator_id"], "duty-bob")
+        self.assertEqual(out["items"][0]["published_revision"], 1)
+        # 版本确实发布
+        got = numbers_at(t2, future)["PR-4"]
+        self.assertEqual(got["revision"], 1)
+        self.assertEqual(got["body"], "三月版")
+        # 审计按原批次写入（release + correction，correction 在新批次）
+        events = service.read_change_feed(None, 1000)["events"]
+        self.assertEqual([(e["operation"], e["number"], e["revision"])
+                          for e in events],
+                         [("release", "PR-4", 0),
+                          ("correction", "PR-4", 1)])
+        self.assertNotEqual(events[0]["batch_seq"], events[1]["batch_seq"])
+
+    def test_approve_batch_applies_in_order_with_prereq_inherit(self):
+        # r0 带前置 PRE；批量提案：先以 r0 更正出 r1（省略继承 PRE），
+        # 再以同批拟生成 r1 为基版出 r2；批准后 r1/r2 前置均为 [PRE]。
+        release("PR-5", prerequisites=["PRE"])
+        p = self._submit([
+            self._pitem("PR-5", 0, t2, t4, body="三月版",
+                        prerequisites=None),
+            self._pitem("PR-5", 1, t3, t4, body="三月中再更正",
+                        prerequisites=None),
+        ])
+        out = service.decide_correction_proposal(
+            p["id"], "approve", None, self.bob)
+        self.assertEqual(
+            [it["published_revision"] for it in out["items"]], [1, 2])
+        hist = {v["revision"]: v for v
+                in service.list_history("PR-5")["items"]}
+        self.assertEqual(hist[1]["prerequisites"], ["PRE"])
+        self.assertEqual(hist[2]["prerequisites"], ["PRE"])
+        # 显式清空也留档/生效
+        p2 = self._submit([self._pitem(
+            "PR-5", 0, "2026-05-01T00:00:00Z", "2026-06-01T00:00:00Z",
+            body="五月", prerequisites=[])])
+        out2 = service.decide_correction_proposal(
+            p2["id"], "approve", None, self.dave)
+        rev = out2["items"][0]["published_revision"]
+        self.assertEqual(
+            service.list_history("PR-5")["items"][rev]["prerequisites"], [])
+        g = service.get_correction_proposal(p2["id"])
+        self.assertEqual(g["items"][0]["prerequisites"], [])
+
+    def test_conflict_at_approval_keeps_pending_and_no_partial_writes(self):
+        release("PR-6")
+        p = self._submit([
+            self._pitem("PR-6", 0, t2, t4, body="提案三月"),
+            self._pitem("PR-6", 1, t3, t4, body="提案三月中"),
+        ])
+        # 提交后、批准前，直接更正抢占了 [t2,t4)
+        correct("PR-6", 0, t2, t4, "直接抢先")
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                p["id"], "approve", None, self.bob)
+        self.assertEqual(ctx.exception.code, "expired_base_version")
+        self.assertEqual(ctx.exception.details["index"], 0)
+        # 提案仍待审，无部分版本/审计
+        self.assertEqual(service.get_correction_proposal(p["id"])["status"],
+                         "pending")
+        self.assertEqual(
+            [v["revision"] for v in service.list_history("PR-6")["items"]],
+            [0, 1])
+        ops = [(e["operation"], e["revision"])
+               for e in service.read_change_feed(None, 1000)["events"]]
+        self.assertEqual(ops, [("release", 0), ("correction", 1)])
+
+        # 第二条非法也能定位到位置：撤回首条抢占后，r1 已撤回 ->
+        # 批准整批在 index=1 处得到 base_version_withdrawn，仍回滚。
+        withdraw("PR-6", 1)
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                p["id"], "approve", None, self.bob)
+        self.assertEqual(ctx.exception.code, "base_version_withdrawn")
+        self.assertEqual(ctx.exception.details["index"], 1)
+        self.assertEqual(service.get_correction_proposal(p["id"])["status"],
+                         "pending")
+
+    def test_reject_records_reviewer_and_publishes_nothing(self):
+        release("PR-7")
+        p = self._submit([self._pitem("PR-7", 0, t2, t3)], self.carol)
+        out = service.decide_correction_proposal(
+            p["id"], "reject", "理由", self.dave)
+        self.assertEqual(out["status"], "rejected")
+        self.assertEqual(out["reason"], "理由")
+        self.assertEqual(out["reviewer"]["operator_id"], "reviewer-dave")
+        self.assertIsNotNone(out["decided_at"])
+        self.assertIsNone(out["items"][0].get("published_revision"))
+        # 已拒绝不可批准
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                p["id"], "approve", None, self.bob)
+        self.assertEqual(ctx.exception.code,
+                         "rejected_proposal_not_approvable")
+        # 重复拒绝
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                p["id"], "reject", None, self.bob)
+        self.assertEqual(ctx.exception.code, "proposal_already_decided")
+        # 无版本/审计
+        self.assertEqual(
+            [v["revision"] for v in service.list_history("PR-7")["items"]],
+            [0])
+        self.assertEqual(
+            [e["operation"]
+             for e in service.read_change_feed(None, 1000)["events"]],
+            ["release"])
+
+    def test_concurrent_approval_succeeds_at_most_once(self):
+        import threading
+        release("PR-8")
+        p = self._submit([self._pitem(
+            "PR-8", 0, "2026-05-01T00:00:00Z", "2026-06-01T00:00:00Z")])
+        results: list[str] = []
+        lock = threading.Lock()
+
+        def decide(reviewer):
+            try:
+                service.decide_correction_proposal(
+                    p["id"], "approve", None, reviewer)
+                code = "ok"
+            except DomainError as exc:
+                code = exc.code
+            with lock:
+                results.append(code)
+
+        threads = [threading.Thread(target=decide, args=(self.bob,)),
+                   threading.Thread(target=decide, args=(self.dave,))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results),
+                         ["ok", "proposal_already_decided"])
+        g = service.get_correction_proposal(p["id"])
+        self.assertEqual(g["status"], "approved")
+        # 只发布了一个更正版本 r1
+        self.assertEqual(
+            [v["revision"] for v in service.list_history("PR-8")["items"]],
+            [0, 1])
+
+    def test_get_missing_proposal_404(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.get_correction_proposal("nope")
+        self.assertEqual(ctx.exception.code, "proposal_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                "nope", "approve", None, self.bob)
+        self.assertEqual(ctx.exception.code, "proposal_not_found")
+
+    def test_invalid_decision_value(self):
+        release("PR-9")
+        p = self._submit([self._pitem("PR-9", 0, t2, t3)])
+        with self.assertRaises(DomainError) as ctx:
+            service.decide_correction_proposal(
+                p["id"], "maybe", None, self.bob)
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(service.get_correction_proposal(p["id"])["status"],
+                         "pending")
 
 
 if __name__ == "__main__":
